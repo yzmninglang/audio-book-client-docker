@@ -1,0 +1,75 @@
+# ============================================================
+# 有声书合成客户端 — Git 忽略规则
+# 原则:只跟踪「源码 / 文档」;
+#       音色库素材、外部依赖、派生产物、环境与运行时数据一律不入库。
+# 依据:doc/findings.md §1.1(素材现状)、doc/dev-workflow.md §1.3、doc/architecture.md §6
+# ============================================================
+
+# ---------- 1. reference/ 下的内容一律不入库 ----------
+# 1.1 音色库素材:约 59MB 二进制(wav),非源码,按需求不纳入版本控制。
+#     需在本地及部署侧另行提供(见 doc/architecture.md §6 的 /voices 卷)。
+#     注:其中的人声分离产物(output_spleeter/、vocals/accompaniment)、
+#         重复副本(1 - 副本.wav)、异常 mp3 也因此一并不入库。
+/reference/audio/
+# 1.2 外部依赖:index-tts-main 是指向仓库外(../OSCR/index-tts-main)的符号链接,
+#     入库会写入本机绝对路径,换机器即失效。
+/reference/project/
+
+# ---------- 2. 本地开发数据(模拟容器三卷,见 doc/dev-workflow.md §1.3) ----------
+/dev-data/
+
+# ---------- 3. 运行时产物 ----------
+# 片段临时目录:章节拼接完成后会被自动清理
+process_audio/
+*.log
+logs/
+
+# ---------- 4. Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
+
+# ---------- 5. 前端 Node / Vue(src/web) ----------
+node_modules/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log
+
+# ---------- 6. 配置与密钥 ----------
+.env
+.env.*
+!.env.example
+# 运行时设置文件(容器 /config 卷内容);如需入库示例,请用 config.example.json
+config.json
+
+# ---------- 7. 编辑器 / 操作系统 ----------
+.vscode/
+.idea/
+.claude/settings.local.json
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+
+# ============================================================
+# 注意(工作区成品目录):
+#   容器 /workspace 与本地 dev-data/workspace 都在仓库之外,无需额外规则。
+#   若把工作区放进仓库内,请补充锚定规则,例如:
+#     /books/*/audio/
+#     /books/*/process_audio/
+# ============================================================
