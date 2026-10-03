@@ -71,7 +71,7 @@ audiobook/
 │   │   └── codec.py               #   base64 编解码 + 体积估算
 │   │
 │   ├── tts/                       # 【TTS 接入模块】
-│   │   ├── base.py                #   TTSProvider 抽象(Protocol)
+│   │   ├── base.py                #   TTSProvider 契约(再导出 models.py 的定义,避免两份漂移)
 │   │   ├── registry.py            #   provider 注册表 ← 新增后端只改这里 +1 行
 │   │   ├── capabilities.py        #   能力自描述(TTSCapabilities / ParamSpec)
 │   │   ├── indextts_client.py     #   /api/tts 实现 + 字段映射

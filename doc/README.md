@@ -22,7 +22,7 @@
 | [audio/design.md](audio/design.md) | 音频处理模块 | 【已确认】 |
 | [tts/design.md](tts/design.md) | TTS 接入模块(契约映射、重试分层) | 【已确认】 |
 | [voice/design.md](voice/design.md) | 音色库模块 | 【已确认】 |
-| [project/design.md](project/design.md) | 工程模块 + **续传 manifest 协议** | 协议【待评审】 |
+| [project/design.md](project/design.md) | 工程模块 + **续传 manifest 协议** | 【已确认】 |
 | [synthesis/design.md](synthesis/design.md) | 编排层:流水线、队列、进度 | 【已确认】 |
 | [api/design.md](api/design.md) | HTTP 层与 SSE | 【已确认】 |
 | [web/design.md](web/design.md) | Vue3 前端 | 【已确认】 |

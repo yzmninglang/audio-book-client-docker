@@ -1,0 +1,36 @@
+# ============================================================================
+# 有声书合成客户端 —— docker-compose
+#
+# 规格来源:doc/deploy/deployment.md §4(compose)、§4.1(三个卷)、§4.2(PUID/PGID)
+# 形态:单容器、单端口、无 GPU;NAS 上常驻,局域网浏览器访问。
+# ============================================================================
+services:
+  audiobook:
+    image: audiobook-client:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: audiobook
+    # host:container —— 容器内固定 8000;NAS 侧默认 8301(deployment.md §4)
+    ports:
+      - "8301:8000"
+    environment:
+      # ── NAS 部署第一坑(deployment.md §4.2)──────────────────────────────
+      # 必须与 /workspace、/voices、/config 共享文件夹的**所有者**一致,
+      # 否则容器写 process_audio/、audio/ 会 Permission denied。
+      - PUID=1000
+      - PGID=1000
+      # ── 时区与 UTF-8 locale(deployment.md §3/§4)────────────────────────
+      - TZ=Asia/Shanghai
+      - LANG=C.UTF-8
+      - LC_ALL=C.UTF-8
+      # ── 应用端口(与上方 container 侧端口保持一致)─────────────────────
+      - AUDIOBOOK_PORT=8000
+    volumes:
+      # 三个卷缺一不可(deployment.md §4.1)
+      - /volume1/audiobook/workspace:/workspace   # 书籍工程 <书名>/{json,process_audio,audio}
+      - /volume1/audiobook/voices:/voices         # 音色库(37 个中文名音色)
+      - /volume1/audiobook/config:/config         # config.json
+    restart: unless-stopped
+    # 无 GPU 需求:拼接为纯 CPU/PCM 字节连接,不声明 deploy.resources GPU 段。
+    # 日志走 stdout:用 `docker logs audiobook` 查看(deployment.md §6)。

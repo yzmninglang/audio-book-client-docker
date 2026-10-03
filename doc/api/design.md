@@ -17,7 +17,9 @@
 | `/api/settings/providers` | GET | 可用 provider 列表 + 各自 `capabilities` 与 `param_schema`(供前端**动态渲染**) |
 | `/api/tts/probe` | POST | **测试连接**(真实极短合成探测) |
 | `/api/projects` | GET | 列出工作区内工程 |
-| `/api/projects` | POST | 新建工程(建目录 + 导入 JSON) |
+| `/api/projects` | POST | 新建工程(建目录 + 从**容器内路径**导入 JSON) |
+| `/api/projects/upload` | POST | 新建工程(**浏览器上传** JSON,multipart) |
+| `/api/projects/{name}/chapters` | POST | 给已有工程**追加/替换章节**(multipart) |
 | `/api/projects/{name}` | GET | 工程详情:章节清单、角色列表、绑定、manifest 摘要 |
 | `/api/projects/{name}/bindings` | GET/PUT | 角色→音色 绑定读写 |
 | `/api/projects/{name}/chapters/{ch}/audio` | GET | 试听章节成品 |
@@ -42,6 +44,16 @@ GET /api/fs/browse?path=/workspace/三体
     "dirs": [{"name": "json", "has_children": true}, ...],
     "is_project": true }
 ```
+
+**虚拟根 `/`**:根路径返回**允许的卷根列表**(而非磁盘 `/` 的内容),这样前端的面包屑「回到根」才有落点。
+
+```json
+{"path": "/", "parent": null, "virtual": true,
+ "dirs": [{"name": "workspace", "path": "/workspace", "has_children": true},
+          {"name": "voices",    "path": "/voices",    "has_children": true}]}
+```
+
+> 磁盘的 `/` 本身**仍然拒绝** —— 虚拟根只暴露被允许的两个卷根,不泄漏容器文件系统结构。
 
 **安全约束(必须实现)**:
 
@@ -69,7 +81,14 @@ GET /api/jobs/events        (text/event-stream)
 
 ## 5. 出入参要点
 
-- **音频传输**:试听类接口直接返回 `audio/wav` 字节流(不是 base64),让浏览器原生播放
+- **音频传输**——按接口性质分两类:
+  - **资源型 GET**(章节成品 `.../audio`、音色试听 `.../preview`):直接返回 `audio/wav` **字节流**,让浏览器原生播放
+  - **诊断型 POST**(`/api/tts/probe`):返回 JSON,其中 `sample_audio` 为 **base64 字符串**
+
+> ⚠️ **不要指望 Pydantic 自动处理**:实测 `pydantic 2.13` / `fastapi 0.142` 下,
+> `bytes` 字段在 JSON 模式下**不会**自动 base64 —— `model_dump_json` 抛 `PydanticSerializationError`、
+> `jsonable_encoder` 抛 `UnicodeDecodeError`。
+> 必须在路由里**显式** `base64.b64encode(...).decode("ascii")`。
 - **上传**:音色新建/编辑用 `multipart/form-data`
 - **错误格式**:统一 `{"error": {"kind": "...", "message": "..."}}`,
   `kind` 复用 `errors.py` 的分类(`retryable` / `fatal` / `config` / `not_found` / `invalid`)
@@ -91,3 +110,166 @@ src/api/app.py
 
 - 是否需要**访问鉴权**?当前决策为局域网可信环境、不做登录。
   若 NAS 有端口暴露风险,建议至少加一层反代 Basic Auth(部署层解决,不改应用代码)。
+
+## 8. 契约细节(已定稿)
+
+> 前端(M6)先于后端(M5)落地,它对若干未钉死的形状做了合理假设。
+> **这些假设在此正式确认为契约**,后端 `schemas.py` 必须与之对齐,否则前后端对不上。
+
+### 8.1 `GET /api/projects/{name}` 详情
+
+```json
+{
+  "name": "三体",
+  "chapters": [{"name": "P01_扉页", "sentence_count": 103, "status": "pending",
+                "output": null, "done_fragments": 0, "failed_fragments": 0}],
+  "roles": [{"name": "旁白", "voice": "男旁白2", "emo_ref": null, "status": "ok"}],
+  "bindings": {"version": 1, "bindings": {"旁白": {"voice": "男旁白2", "emo_ref": null}}},
+  "manifest_summary": {"done": 0, "partial": 0, "pending": 1},
+  "stale_chapters": [{"name": "P01_扉页", "stale_fragments": [12, 13]}],
+  "warnings": []
+}
+```
+
+`roles[].status` ∈ `ok` / `unbound` / `invalid`,**由后端计算**。
+依据 [web/design.md §1](../web/design.md) 的 R6:「所有判定由后端给出」—— 前端不做同名推断。
+
+**`stale_chapters`**:绑定被改动后,已生成片段所用的音色与当前绑定不符的章节。
+
+⚠️ **必须用只读函数 `detect_binding_stale()`**([project/design.md §5.5](../project/design.md#55-绑定变更与后端变更的处理)):
+
+- `chapters[].status` 表示 **manifest 里真实持久化的状态**,GET 详情**不得改写它**
+- 若误用会就地改写的 `mark_binding_stale()`,同一请求内后续的 `done_fragments` 计数会**归零** ——
+  一个实际有 3 条已完成片段的章节会显示成 0 条。这是**读接口产生副作用**导致的数据错误
+- 正确语义:`status = done` + `stale_chapters` 里有它 = **「已完成,但基于旧绑定生成」**,由用户决定是否重做
+- 会改写的 `mark_binding_stale()` 保留给**显式操作**(UI 的「重做受影响章节」)使用
+
+> 为什么放在这里而不是 `synthesis/` 的对账里:完成态章节会在 §5.4 第 1 步被短路跳过,
+> 绑定检查够不到它。而**「打开工程时提示绑定已变更」正是工程详情的天然职责** ——
+> 用户一进页面就该看到,而不是等下次跑合成才发现。
+>
+> 语义照旧:**只提示,不自动重做**(用户可能只是试验),重做由 UI 的「重做受影响章节」按钮触发。
+
+### 8.2 `PUT /api/projects/{name}/bindings` 请求体
+
+```json
+{"version": 1, "bindings": {"旁白": {"voice": "男旁白2", "emo_ref": null}}}
+```
+
+### 8.3 `POST /api/projects` 请求体
+
+```json
+{"name": "三体", "source_path": "/workspace/import/三体"}
+```
+
+`source_path` 为**容器内路径**,由 `/api/fs/browse` 选定(容器化约束 #8)。
+
+### 8.4 `PUT /api/voices/{name}` 请求体
+
+`multipart/form-data`,三个字段**均可选**:
+
+| 字段 | 说明 |
+|---|---|
+| `audio`(**也接受 `file`**) | 新的参考音频文件。前端 `client.ts` 实际发送 `file`,为免对不上,后端两者都收 |
+| `prompt_text` | 参考文本;省略=不改动,空串=清除(见 [voice/design.md §4](../voice/design.md)) |
+| `rename` | 新音色名;省略=不改名 |
+
+> ⚠️ FastAPI 的 `Form(str | None)` 会把**空串折叠成 `None`**,无法区分「省略」与「清空」。
+> 需手动解析 `request.form()` 才能实现上表的语义。
+
+### 8.5 `GET /api/settings/providers`
+
+```json
+[{"id": "indextts2", "label": "IndexTTS2",
+  "capabilities": {"emotion": ["vector","ref_audio","text"], "emotion_vector_dims": 8,
+                   "voice_modes": ["audio_bytes"], "needs_prompt_text": false,
+                   "supports_concurrent": false, "returns_canonical": true},
+  "param_schema": [{"name": "temperature", "label": "温度", "type": "float",
+                    "default": 0.8, "minimum": 0.1, "maximum": 2.0}]}]
+```
+
+`param_schema` 位于 provider **顶层**(不在 `capabilities` 内),与 [web/design.md §3.4](../web/design.md) 一致。
+
+### 8.6 `GET /api/jobs/state` 响应体
+
+```json
+{"state": "running", "project": "三体", "current_chapter": "P01_扉页",
+ "done_fragments": 42, "total_fragments": 103,
+ "chapters": [{"name": "P01_扉页", "status": "synthesizing",
+               "done": 42, "total": 103, "failed": 0}],
+ "eta_seconds": 183, "recent_logs": [{"level": "warn", "message": "..."}]}
+```
+
+`state` ∈ `idle` / `running` / `paused` / `stopped`(与 `models.JobState` 一致)。
+`eta_seconds` 可为 `null` —— 前端会退化为「剩余条数 × 3s」本地估算。
+
+### 8.7 SSE 帧格式(`GET /api/jobs/events`)
+
+**标准形式为具名事件**(事件类型即 `models`/`synthesis/events.py` 中的事件名):
+
+```
+event: fragment_done
+data: {"chapter":"P01_扉页","index":42,"elapsed_ms":3100,"done":42,"total":103}
+
+event: job_state
+data: {"state":"running"}
+```
+
+- 事件类型:`chapter_started` / `fragment_done` / `fragment_failed` /
+  `chapter_concatenated` / `chapter_failed` / `job_state` / `log`
+- 另有**心跳注释行**(`: keep-alive`)保活,防反代掐断空闲连接
+- 前端同时兼容「默认 message 事件 + data 内带 `type`」的写法,但**后端按具名事件实现**
+
+### 8.8 错误响应(全站统一)
+
+```json
+{"error": {"kind": "binding", "message": "角色未绑定音色: 常伟思"}}
+```
+
+`kind` 取自 `src/errors.py` 的异常 `kind`:`retryable` / `fatal` / `invalid` /
+`config` / `not_found` / `binding` / `manifest`。
+HTTP 状态映射:`invalid`→400、`not_found`→404、`config`/`binding`→409、其余→500。
+
+### 8.9 章节 JSON 上传(需求扩展,2026-10-03)
+
+**为什么需要**:原设计只支持「先把书拷进 NAS 卷 → 用路径浏览器选中」。
+但音色库是支持浏览器上传的,工程却不行 —— 这个不对称让用户困惑(见 [requirements.md §5.1](../requirements.md#51-需求扩展记录))。
+
+#### `POST /api/projects/upload` —— 上传建工程
+
+`multipart/form-data`:
+
+| 字段 | 说明 |
+|---|---|
+| `name` | 工程名 |
+| `files` | 一个或多个章节 JSON(`.json`) |
+
+行为:建目录骨架 → 把文件写入 `json/` → 返回工程详情(`ProjectDetailOut`)。
+
+#### `POST /api/projects/{name}/chapters` —— 追加/替换章节
+
+`multipart/form-data`:
+
+| 字段 | 说明 |
+|---|---|
+| `files` | 一个或多个章节 JSON(`.json`) |
+
+行为:写入 `json/`;**同名文件覆盖**。返回更新后的工程详情。
+
+> **同名覆盖会自然触发续传机制**:该章 `json_sha256` 变化 → [project/design.md §5.4](../project/design.md#54-启动对账算法) 判定片段作废并重做。
+> 不需要为「换稿」新增任何机制 —— 续传设计本来就为此准备。
+
+#### ⚠️ 上传是新增的攻击面,必须设限
+
+| 约束 | 值 | 理由 |
+|---|---|---|
+| 只接受 `.json` 扩展名 | — | 其余一律 400 |
+| 文件名净化 | 取 `basename`,拒绝含 `/`、`\`、`..`、控制字符、超长名 | 防路径穿越写入卷外 |
+| 单文件大小上限 | **8 MB** | 实测章节 JSON 约 33KB,留足余量 |
+| 单次文件数上限 | **200** | 防资源耗尽 |
+| 总大小上限 | **64 MB** | 同上 |
+| 落盘路径 | 只能落在 `<工程>/json/` 内 | 复用 `resolve_within_roots` 的同类校验思路 |
+| 工程名 | 复用 `validate_project_name` | 与既有建工程一致 |
+| 工程重名 | **409**(`invalid`) | 不静默覆盖 |
+
+> 与 `/api/fs/browse` 是同一类问题的两面:`browse` 防的是**读**越界,上传防的是**写**越界。

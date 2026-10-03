@@ -28,14 +28,24 @@
 
 实测:37 个参考音频里有 **3 个 `.wav` 实为 MP3**(见 [findings.md](../findings.md#11-音色库-referenceaudio))。
 
-→ `probe.py` **必须读 magic bytes**,判定优先级:
+→ `probe.py` 必须以**解码库的真实判定**为准,扩展名只作参考:
 
 ```
-1. RIFF/WAVE 头 → 按 WAV 解析(PCM 用 stdlib wave 直接读)
-2. ID3 / 0xFFFB 帧同步 → 判定为 MP3
-3. 其他 → 交给解码库嗅探
-4. 全部失败 → 抛 FatalError(不可重试)
+1. soundfile.info() 能报出真实格式(实测可识破伪 wav),作为主路径
+2. magic bytes 作快速路径与二次确认
+3. 全部失败 → 抛 FatalError(不可重试)
 ```
+
+> 实测:`soundfile` 自带 `libsndfile 1.2.2`,**支持 MP3**,`sf.info("陈平安1/1.wav")`
+> 正确报出 `MP3/MPEG_LAYER_III`。因此不需要手写完整的格式嗅探。
+
+**⚠️ 半截文件(实测存在,必须处理)**
+
+`标准女声/1.wav` 的 WAV 头声明 486400 字节,实际文件只有 187198 字节。
+stdlib `wave` 照头返回 **15.2s**,而 `soundfile` 按物理字节得到 **5.85s(真实)**。
+
+→ 走 stdlib 路径时**必须按物理可用字节夹紧帧数**;任何按头部长度分配缓冲的实现都会踩坑。
+详见 [findings.md §1.1](../findings.md#11-音色库-referenceaudio)。
 
 ### 3.2 只降不升(≤22050)
 
@@ -94,12 +104,25 @@ class AudioInfo:
     duration: float
     is_actually_what_ext_says: bool   # 扩展名是否可信
 
-def probe(data: bytes) -> AudioInfo: ...
+# filename 仅用于判定 is_actually_what_ext_says;不传时不臆断(默认 True)
+def probe(data: bytes, *, filename: str | None = None) -> AudioInfo: ...
 
 # convert.py
 def to_reference_audio(data: bytes, *, max_seconds: float = 15.0,
                        max_sample_rate: int = 22050) -> bytes:
-    """入库用:mono + 只降不升 + 裁剪。返回标准 PCM WAV 字节。"""
+    """【入库用】mono + 只降不升 + 裁剪 ≤15s。返回标准 PCM WAV 字节。"""
+
+def to_canonical(data: bytes, fmt: AudioFormat | None = None
+                 ) -> tuple[bytes, AudioFormat]:
+    """【归一化用,硬规则 R7 的入口】任意后端输出 → CANONICAL_FORMAT。
+
+    - 采样率:**可升可降**,一律到 22050(与 to_reference_audio 刻意相反)
+    - 声道/位深:一律 mono / 16bit
+    - **不裁剪时长**(片段必须完整)
+    - 已符合 CANONICAL_FORMAT 时原样返回(零开销快路径)
+
+    调用方是 synthesis/,不是 tts/ —— 见 architecture.md §5.2 与 R7。
+    """
 
 # segment.py
 def silence(ms: int, sample_rate: int, channels: int, sampwidth: int) -> bytes: ...

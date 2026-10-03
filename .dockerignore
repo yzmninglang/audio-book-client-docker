@@ -1,0 +1,63 @@
+# ============================================================================
+# Docker 构建上下文忽略规则
+#
+# 目标(硬约束):镜像内**不得**出现 .venv / node_modules / dev-data /
+# __pycache__ / tests(见任务 §硬约束 2)。音色库、参考素材、文档等大体积
+# 非运行时资源也一律排除(它们走卷,不进镜像)。
+# ============================================================================
+
+# ---------- 1. VCS / 编辑器 / 本地配置 ----------
+.git
+.gitignore
+.github
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 2. Python 环境与缓存 ----------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+build/
+
+# ---------- 3. 本地开发数据(模拟容器三卷,dev-workflow.md §1.3)----------
+dev-data/
+
+# ---------- 4. 前端依赖与产物 ----------
+# node_modules 由 stage1 的 npm ci 安装;dist 由 stage1 构建生成 —— 都不进上下文。
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+
+# ---------- 5. 测试(镜像不需要)----------
+tests/
+
+# ---------- 6. 大体积非运行时资源(音色库/参考素材/后端参考实现/文档)----------
+reference/
+book-json/
+server/
+doc/
+prompt.md
+*.md
+
+# ---------- 7. 配置与密钥(运行时经 /config 卷提供)----------
+.env
+.env.*
+!.env.example
+config.json
+
+# 注:docker/ 与 Dockerfile、pyproject.toml **不排除** —— 构建需要它们。

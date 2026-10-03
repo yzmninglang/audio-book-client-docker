@@ -1,0 +1,37 @@
+[project]
+name = "audiobook-client"
+version = "0.1.0"
+description = "有声书合成客户端(零算力,NAS 服务端形态)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "httpx>=0.27",
+    "soundfile>=0.12",
+    "numpy>=1.26",
+    "soxr>=0.5",
+    "python-multipart>=0.0.12",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.7",
+    "mypy>=1.13",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "integration: 需要真实 TTS 后端(公网、GPU),默认跳过",
+]
+addopts = "-m 'not integration'"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
