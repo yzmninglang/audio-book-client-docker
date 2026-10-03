@@ -31,6 +31,15 @@ export const useJobsStore = defineStore('jobs', () => {
   const totalFragments = computed(() => status.value.total_fragments || 0)
   const doneFragments = computed(() => status.value.done_fragments || 0)
 
+  /** 正在运行的任务所属工程(用于禁用删除入口);无运行任务时为 null */
+  const runningProject = computed(() =>
+    state.value === 'running' ? status.value.project ?? null : null,
+  )
+  /** 正在合成的章节名;无则为 null */
+  const runningChapter = computed(() =>
+    state.value === 'running' ? status.value.current_chapter ?? null : null,
+  )
+
   /** 粗略 ETA:优先用后端值,否则按「剩余条数 × 实测均值(默认 3s)」 */
   const etaSeconds = computed<number | null>(() => {
     if (status.value.eta_seconds != null) return status.value.eta_seconds
@@ -192,6 +201,8 @@ export const useJobsStore = defineStore('jobs', () => {
     chapters,
     totalFragments,
     doneFragments,
+    runningProject,
+    runningChapter,
     etaSeconds,
     etaLabel,
     connect,

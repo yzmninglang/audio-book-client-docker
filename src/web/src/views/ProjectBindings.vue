@@ -3,8 +3,10 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
+import type { UploadUserFile } from 'element-plus'
+
 import VoiceSelect from '@/components/VoiceSelect.vue'
-import { ApiError } from '@/api/client'
+import { ApiError, CHAPTER_FILE_LIMITS, validateChapterFiles } from '@/api/client'
 import type { BindingsFile, RoleStatus, StaleChapter } from '@/api/types'
 import { useProjectsStore } from '@/stores/projects'
 import { useSettingsStore } from '@/stores/settings'
@@ -29,6 +31,11 @@ interface Row {
 const rows = ref<Row[]>([])
 const saving = ref(false)
 const loading = ref(false)
+
+// 追加章节(需求扩展 §8.9)
+const appendVisible = ref(false)
+const appending = ref(false)
+const appendFileList = ref<UploadUserFile[]>([])
 
 const unboundCount = computed(() => rows.value.filter((r) => !r.voice).length)
 /** 绑定指向的音色已被删除(且尚未改绑) */
@@ -146,6 +153,40 @@ async function startSynthesis() {
   router.push(`/projects/${encodeURIComponent(props.name)}/synthesis`)
 }
 
+function openAppend() {
+  appendFileList.value = []
+  appendVisible.value = true
+}
+
+function appendRawFiles(): File[] {
+  const out: File[] = []
+  for (const f of appendFileList.value) if (f.raw) out.push(f.raw)
+  return out
+}
+
+async function submitAppend() {
+  const files = appendRawFiles()
+  const invalid = validateChapterFiles(files)
+  if (invalid) {
+    ElMessage.warning(invalid)
+    return
+  }
+  appending.value = true
+  try {
+    await projects.appendChapters(props.name, files)
+    appendVisible.value = false
+    ElMessage.success(`已追加/替换 ${files.length} 个章节,章节列表已刷新`)
+  } catch (err) {
+    ElMessage.error(err instanceof ApiError ? err.message : String(err))
+  } finally {
+    appending.value = false
+  }
+}
+
+function mb(bytes: number) {
+  return Math.round((bytes / (1024 * 1024)) * 10) / 10
+}
+
 function statusTag(row: Row) {
   if (!row.voice) return { type: 'warning' as const, text: '需绑定' }
   if (!voices.exists(row.voice)) return { type: 'danger' as const, text: '已失效' }
@@ -161,6 +202,9 @@ function statusTag(row: Row) {
       </el-button>
       <h2 class="page-title">{{ props.name }} · 角色绑定</h2>
       <span class="spacer" />
+      <el-button @click="openAppend">
+        <el-icon><Upload /></el-icon>&nbsp;追加章节
+      </el-button>
       <el-button @click="applySameNameRecommendation">同名推荐</el-button>
       <el-button :loading="saving" @click="save">保存绑定</el-button>
       <el-button type="primary" @click="startSynthesis">开始合成</el-button>
@@ -265,6 +309,38 @@ function statusTag(row: Row) {
         </template>
       </el-table-column>
     </el-table>
+
+    <!-- 追加章节 -->
+    <el-dialog v-model="appendVisible" title="追加章节 JSON" width="620px">
+      <el-alert
+        type="warning"
+        show-icon
+        :closable="false"
+        class="mb"
+        title="同名章节将被替换"
+        description="若文件名已存在,该章 JSON 会被覆盖,其已生成的音频将失效并需要重做(后端按 json_sha256 变化自动作废旧片段)。"
+      />
+      <el-upload
+        v-model:file-list="appendFileList"
+        :auto-upload="false"
+        multiple
+        accept=".json,application/json"
+        drag
+      >
+        <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
+        <div class="el-upload__text">把章节 JSON 拖到这里,或<em>点击选择</em></div>
+        <template #tip>
+          <div class="muted">
+            只接受 .json。单文件 ≤ {{ mb(CHAPTER_FILE_LIMITS.maxFileBytes) }} MB、
+            单次 ≤ {{ CHAPTER_FILE_LIMITS.maxCount }} 个、总计 ≤ {{ mb(CHAPTER_FILE_LIMITS.maxTotalBytes) }} MB。
+          </div>
+        </template>
+      </el-upload>
+      <template #footer>
+        <el-button @click="appendVisible = false">取消</el-button>
+        <el-button type="primary" :loading="appending" @click="submitAppend">上传</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 

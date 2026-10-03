@@ -108,6 +108,29 @@ async function redoStale() {
   }
 }
 
+async function removeChapter(chapter: string) {
+  try {
+    await ElMessageBox.confirm(
+      `将删除章节《${chapter}》的 JSON 与中间片段。该章已生成的音频会移入 audio/.stale/,不会立即丢失。`,
+      '删除章节',
+      {
+        type: 'warning',
+        confirmButtonText: '删除',
+        cancelButtonText: '取消',
+        confirmButtonClass: 'el-button--danger',
+      },
+    )
+  } catch {
+    return
+  }
+  try {
+    await projects.deleteChapter(props.name, chapter)
+    ElMessage.success(`已删除章节:${chapter}`)
+  } catch (err) {
+    ElMessage.error(err instanceof ApiError ? err.message : String(err))
+  }
+}
+
 async function pause() {
   try {
     await jobs.pause()
@@ -220,7 +243,7 @@ async function stop() {
         <el-table-column prop="output" label="成品路径" min-width="180">
           <template #default="{ row }">{{ row.output || '—' }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="120">
+        <el-table-column label="操作" width="180">
           <template #default="{ row }">
             <el-button
               size="small"
@@ -231,6 +254,19 @@ async function stop() {
             >
               {{ row.status === 'done' ? '重做' : '开始此章' }}
             </el-button>
+            <el-tooltip :disabled="jobs.runningChapter !== row.name" content="该章正在合成,无法删除">
+              <span>
+                <el-button
+                  size="small"
+                  text
+                  type="danger"
+                  :disabled="jobs.runningChapter === row.name"
+                  @click="removeChapter(row.name)"
+                >
+                  删除
+                </el-button>
+              </span>
+            </el-tooltip>
           </template>
         </el-table-column>
       </el-table>

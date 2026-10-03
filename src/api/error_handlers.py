@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..errors import AudiobookError
+from .errors import AlreadyExistsError
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ _KIND_TO_STATUS: dict[str, int] = {
     "not_found": 404,
     "config": 409,
     "binding": 409,
+    "conflict": 409,
 }
 _DEFAULT_STATUS = 500
 
@@ -53,6 +55,14 @@ def _http_status_to_kind(status: int) -> str:
 
 
 def register_error_handlers(app: FastAPI) -> None:
+    @app.exception_handler(AlreadyExistsError)
+    async def _already_exists(_request: Request, exc: AlreadyExistsError) -> JSONResponse:
+        # 资源已存在 → 409,但 kind 仍为 invalid(§8.9)。Starlette 按 MRO 取最具体处理器。
+        return JSONResponse(
+            status_code=409,
+            content=_error_body("invalid", exc.message, exc.detail),
+        )
+
     @app.exception_handler(AudiobookError)
     async def _audiobook_error(_request: Request, exc: AudiobookError) -> JSONResponse:
         logger.warning("领域异常: %s", exc.message)

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import time
 from pathlib import Path
 
@@ -30,7 +31,9 @@ from fastapi.testclient import TestClient
 
 from src.api.app import create_app
 from src.config import ProviderConfig, Settings
+from src.errors import InvalidInputError
 from src.models import CANONICAL_FORMAT, HealthResult, TTSResult
+from src.project import Project
 from src.synthesis import SynthesisQueue
 from src.tts import registry
 from src.tts.capabilities import ParamSpec, TTSCapabilities
@@ -147,7 +150,11 @@ def test_all_15_routes_present(client: TestClient):
         ("/api/tts/probe", "post"),
         ("/api/projects", "get"),
         ("/api/projects", "post"),
+        ("/api/projects/upload", "post"),  # §8.9
         ("/api/projects/{name}", "get"),
+        ("/api/projects/{name}", "delete"),  # §8.10
+        ("/api/projects/{name}/chapters", "post"),  # §8.9
+        ("/api/projects/{name}/chapters/{chapter}", "delete"),  # §8.10
         ("/api/projects/{name}/bindings", "get"),
         ("/api/projects/{name}/bindings", "put"),
         ("/api/projects/{name}/chapters/{chapter}/audio", "get"),
@@ -706,3 +713,314 @@ def test_static_spa_and_assets(client: TestClient):
 
     # 未知 API 路径 → JSON 404(不回落 SPA)
     assert client.get("/api/definitely-not-here").status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# 章节 JSON 上传(§8.9,需求扩展) —— POST /api/projects/upload
+#                             POST /api/projects/{name}/chapters
+# --------------------------------------------------------------------------- #
+
+JSON_CT = "application/json"
+
+
+def _chap(pairs: list[tuple[str, str]]) -> bytes:
+    return json.dumps(
+        [
+            {"speaker": s, "content": c, "emo_vector": [0] * 8, "delay": 50}
+            for s, c in pairs
+        ],
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _files(*items: tuple[str, bytes]) -> list[tuple[str, tuple[str, bytes, str]]]:
+    return [("files", (name, data, JSON_CT)) for name, data in items]
+
+
+def test_upload_project_multiple_files(client: TestClient, tmp_path: Path):
+    resp = client.post(
+        "/api/projects/upload",
+        data={"name": "上传书"},
+        files=_files(
+            ("A.json", _chap([("甲", "a")])),
+            ("B.json", _chap([("乙", "b"), ("丙", "c")])),
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    detail = resp.json()
+    assert detail["name"] == "上传书"
+    assert {c["name"] for c in detail["chapters"]} == {"A", "B"}
+    assert {c["sentence_count"] for c in detail["chapters"]} == {1, 2}
+    assert {r["status"] for r in detail["roles"]} == {"unbound"}
+    # 落盘文件名正确
+    assert (tmp_path / "上传书" / "json" / "A.json").is_file()
+    assert (tmp_path / "上传书" / "json" / "B.json").is_file()
+    # 工作区能列出
+    assert "上传书" in {p["name"] for p in client.get("/api/projects").json()}
+
+
+def test_upload_project_conflict_is_409(client: TestClient):
+    payload = {"name": "重复书"}
+    files = _files(("A.json", _chap([("甲", "a")])))
+    assert client.post("/api/projects/upload", data=payload, files=files).status_code == 200
+    dup = client.post("/api/projects/upload", data=payload, files=files)
+    assert dup.status_code == 409, dup.text
+    assert dup.json()["error"]["kind"] == "invalid"
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    ["../../evil.json", "a/b.json", "..json", "evil.txt", ""],
+)
+def test_upload_rejects_bad_filename_no_write_outside(
+    client: TestClient, tmp_path: Path, bad_name: str
+):
+    resp = client.post(
+        "/api/projects/upload",
+        data={"name": "攻击书"},
+        files=[("files", (bad_name, _chap([("甲", "a")]), JSON_CT))],
+    )
+    assert resp.status_code == 400, f"{bad_name!r} 未被拒绝: {resp.status_code}"
+    assert resp.json()["error"]["kind"] == "invalid"
+    # 卷外 / 未预期位置无任何写入
+    assert not (tmp_path / "攻击书").exists()
+    assert not (tmp_path / "evil.json").exists()
+    assert not (tmp_path.parent / "evil.json").exists()
+
+
+def test_upload_rejects_empty_file(client: TestClient, tmp_path: Path):
+    resp = client.post(
+        "/api/projects/upload",
+        data={"name": "空书"},
+        files=[("files", ("empty.json", b"", JSON_CT))],
+    )
+    assert resp.status_code == 400
+    assert not (tmp_path / "空书").exists()
+
+
+def test_upload_rejects_oversize_file(client: TestClient, tmp_path: Path):
+    oversize = b"x" * (8 * 1024 * 1024 + 1)
+    resp = client.post(
+        "/api/projects/upload",
+        data={"name": "超大书"},
+        files=[("files", ("big.json", oversize, JSON_CT))],
+    )
+    assert resp.status_code == 400
+    assert not (tmp_path / "超大书").exists()
+
+
+def test_upload_rejects_too_many_files(client: TestClient, tmp_path: Path):
+    many = _files(*[(f"c{i}.json", _chap([("甲", "a")])) for i in range(201)])
+    resp = client.post("/api/projects/upload", data={"name": "海量书"}, files=many)
+    assert resp.status_code == 400
+    assert not (tmp_path / "海量书").exists()
+
+
+def test_upload_rejects_invalid_json_body(client: TestClient, tmp_path: Path):
+    resp = client.post(
+        "/api/projects/upload",
+        data={"name": "坏书"},
+        files=[("files", ("bad.json", b"not-json", JSON_CT))],
+    )
+    assert resp.status_code == 400
+    assert not (tmp_path / "坏书").exists()
+
+
+def test_append_chapters_new_and_overwrite(client: TestClient, tmp_path: Path):
+    base = client.post(
+        "/api/projects/upload",
+        data={"name": "追加书"},
+        files=_files(("A.json", _chap([("甲", "a"), ("甲", "b")]))),
+    )
+    assert base.status_code == 200, base.text
+    assert len(base.json()["chapters"]) == 1
+
+    # 追加新章节 → +1
+    add = client.post(
+        "/api/projects/追加书/chapters",
+        files=_files(("B.json", _chap([("乙", "c")]))),
+    )
+    assert add.status_code == 200, add.text
+    assert {c["name"] for c in add.json()["chapters"]} == {"A", "B"}
+
+    # 同名覆盖 → 章节数不变、内容更新、json_sha256 变化
+    root = tmp_path / "追加书"
+    sha_before = Project.open(root, book="追加书").chapter("A").json_sha256
+    over = client.post(
+        "/api/projects/追加书/chapters",
+        files=_files(("A.json", _chap([("甲", "a"), ("甲", "b"), ("甲", "c")]))),
+    )
+    assert over.status_code == 200, over.text
+    detail = over.json()
+    assert len(detail["chapters"]) == 2  # 不变
+    chapter_a = next(c for c in detail["chapters"] if c["name"] == "A")
+    assert chapter_a["sentence_count"] == 3  # 已更新
+    sha_after = Project.open(root, book="追加书").chapter("A").json_sha256
+    assert sha_after != sha_before
+
+
+def test_append_unknown_project_is_404(client: TestClient):
+    resp = client.post(
+        "/api/projects/不存在/chapters",
+        files=_files(("A.json", _chap([("甲", "a")]))),
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["kind"] == "not_found"
+
+
+@pytest.mark.parametrize("bad_name", ["../../evil", "a/b", "..", "x\x01"])
+def test_append_rejects_bad_filename_no_write_outside(
+    client: TestClient, tmp_path: Path, bad_name: str
+):
+    client.post(
+        "/api/projects/upload",
+        data={"name": "追加防护"},
+        files=_files(("A.json", _chap([("甲", "a")]))),
+    )
+    json_dir = tmp_path / "追加防护" / "json"
+    before = sorted(p.name for p in json_dir.iterdir())
+
+    resp = client.post(
+        "/api/projects/追加防护/chapters",
+        files=[("files", (bad_name, _chap([("甲", "z")]), JSON_CT))],
+    )
+    assert resp.status_code == 400, f"{bad_name!r} 未被拒绝: {resp.status_code}"
+    assert sorted(p.name for p in json_dir.iterdir()) == before  # 目录未变
+    assert not (tmp_path / "evil").exists()
+
+
+def test_safe_json_filename_rejects_control_chars_and_non_json():
+    """控制字符用例直接单测净化函数(TestClient/httpx 会把控制字符百分号编码,送不到服务端)。"""
+    from src.api.routes.projects import _safe_json_filename
+
+    for bad in ("bad\x01.json", "bad\x7f.json", "点.json.txt", "noext", ".json", "x.JSON "):
+        with pytest.raises(InvalidInputError):
+            _safe_json_filename(bad)
+    assert _safe_json_filename("正常.json") == "正常.json"
+    assert _safe_json_filename("P01_扉页.JSON") == "P01_扉页.JSON"
+
+
+# --------------------------------------------------------------------------- #
+# 删除工程 / 章节(§8.10,需求扩展)—— 可恢复,不真删
+# --------------------------------------------------------------------------- #
+
+
+def _wait_current_chapter(client: TestClient, chapter: str, timeout: float = 5.0) -> None:
+    queue = client.app.state.queue
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        snap = queue.snapshot()
+        if snap.get("state") == "running" and snap.get("current_chapter") == chapter:
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"章节 {chapter} 未进入合成态: {queue.snapshot()}")
+
+
+def test_delete_project_moves_to_trash(client: TestClient, tmp_path: Path):
+    client.post(
+        "/api/projects/upload",
+        data={"name": "待删书"},
+        files=_files(("A.json", _chap([("甲", "a")]))),
+    )
+    root = tmp_path / "待删书"
+    assert root.is_dir()
+
+    resp = client.delete("/api/projects/待删书")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["deleted"] == "待删书"
+    assert body["trashed_to"].startswith(".trash/待删书-")
+
+    assert not root.exists()  # 原位置消失
+    trash = tmp_path / ".trash"
+    entries = list(trash.iterdir())
+    assert len(entries) == 1
+    assert (entries[0] / "json" / "A.json").is_file()
+    # 工作区扫描不再列出
+    assert "待删书" not in {p["name"] for p in client.get("/api/projects").json()}
+    # 二次调用 → 404(不是 500)
+    assert client.delete("/api/projects/待删书").status_code == 404
+
+
+def test_delete_nonexistent_project_is_404(client: TestClient):
+    resp = client.delete("/api/projects/不存在")
+    assert resp.status_code == 404
+    assert resp.json()["error"]["kind"] == "not_found"
+
+
+def test_delete_project_while_running_is_409(client: TestClient, project_env, tmp_path: Path):
+    client.app.state.settings.providers["fake"].params["delay"] = 0.3
+    start = client.post("/api/jobs", json={"project": "三体"})
+    assert start.json()["state"] == "running"
+
+    root = tmp_path / "三体"
+    resp = client.delete("/api/projects/三体")
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["kind"] == "conflict"
+    assert root.is_dir()  # 目录未被动过
+
+    client.post("/api/jobs/stop")
+    client.app.state.queue.wait_idle(10.0)
+
+
+def test_delete_chapter_full(client: TestClient, project_env, tmp_path: Path):
+    _run_job_to_completion(client)  # 成品已生成
+    root = tmp_path / "三体"
+
+    # 造一个 process_audio/<章>/ 以验证被删
+    frag_dir = root / "process_audio" / CHAPTER
+    frag_dir.mkdir(parents=True, exist_ok=True)
+    (frag_dir / "9999.wav").write_bytes(b"frag")
+
+    resp = client.delete(f"/api/projects/三体/chapters/{CHAPTER}")
+    assert resp.status_code == 200, resp.text
+    detail = resp.json()
+    assert all(c["name"] != CHAPTER for c in detail["chapters"])
+
+    assert not (root / "json" / f"{CHAPTER}.json").exists()
+    assert not frag_dir.exists()
+    reopened = Project.open(root, book="三体")
+    assert reopened.chapter(CHAPTER) is None
+    assert reopened.manifest.chapter(CHAPTER) is None
+
+    stale = root / "audio" / ".stale"
+    assert stale.is_dir()
+    assert any(f.name == f"{CHAPTER}.wav" for f in stale.iterdir())
+
+    # 二次调用 → 404
+    assert client.delete(f"/api/projects/三体/chapters/{CHAPTER}").status_code == 404
+
+
+def test_delete_chapter_unknown_is_404(client: TestClient, project_env):
+    resp = client.delete("/api/projects/三体/chapters/不存在")
+    assert resp.status_code == 404
+
+
+def test_delete_chapter_while_synthesizing_is_409(client: TestClient, project_env, tmp_path: Path):
+    client.app.state.settings.providers["fake"].params["delay"] = 0.3
+    client.post("/api/jobs", json={"project": "三体"})
+    _wait_current_chapter(client, CHAPTER)
+
+    root = tmp_path / "三体"
+    before = (root / "json" / f"{CHAPTER}.json").read_bytes()
+    resp = client.delete(f"/api/projects/三体/chapters/{CHAPTER}")
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["kind"] == "conflict"
+    assert (root / "json" / f"{CHAPTER}.json").read_bytes() == before  # 什么都没变
+
+    client.post("/api/jobs/stop")
+    client.app.state.queue.wait_idle(10.0)
+
+
+@pytest.mark.parametrize("bad", ["%2E%2E", "%2E%2E%2Fevil", "a%2Fb"])
+def test_delete_chapter_bad_name_rejected(
+    client: TestClient, project_env, tmp_path: Path, bad: str
+):
+    root = tmp_path / "三体"
+    before = sorted(p.name for p in (root / "json").iterdir())
+
+    resp = client.delete(f"/api/projects/三体/chapters/{bad}")
+    # 400(净化拒绝)/ 404(%2F 被解码成路径分隔,路由不匹配)/ 405(路径命中 GET 路由,方法不允许)
+    assert resp.status_code in (400, 404, 405), f"{bad!r} 未被拒: {resp.status_code}"
+    assert sorted(p.name for p in (root / "json").iterdir()) == before  # 卷内未变
+    assert not (tmp_path / "evil").exists()  # 卷外无改动

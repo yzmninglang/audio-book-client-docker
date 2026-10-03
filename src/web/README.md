@@ -97,6 +97,14 @@ grep -rl "__AUDIOBOOK_MOCK_MARKER__" dist/ && echo "!! mock 泄漏进产物" || 
 - **设置页生成参数** 完全由 `GET /api/settings/providers` 返回的 `param_schema` 动态渲染
   (`bool→开关`、`enum→下拉`、`int/float→滑块+数字输入`、`str→输入框`);
   代码中不出现任何硬编码参数名。每个 provider 的参数独立存储。
+- **章节 JSON 上传**(`api/design.md §8.9`):新建工程对话框提供「从服务器路径导入 / 上传 JSON 文件」两种方式
+  (`POST /api/projects/upload`,字段名固定为 `files`);角色绑定页有「追加章节」入口
+  (`POST /api/projects/{name}/chapters`,同名覆盖会重置该章状态并提示已生成音频失效)。
+  前端先做校验(仅 `.json`、单文件 ≤8MB、单次 ≤200 个、总计 ≤64MB),服务端才是权威。
+- **删除**(`api/design.md §8.10`,破坏性操作均可恢复、不真删):工程列表每张卡片可删工程
+  (`DELETE /api/projects/{name}`,目录移入 `.trash/`);合成页章节表每行可删章节
+  (`DELETE /api/projects/{name}/chapters/{chapter}`,成品移入 `audio/.stale/`)。
+  均二次确认且文案说明去向;**正在合成时提前禁用**并提示(服务端仍会 409)。删除成功后刷新列表/详情。
 - **绑定变更提示**:`GET /api/projects/{name}` 返回 `stale_chapters`(片段基于旧绑定生成的章节)。
   角色绑定页与合成进度页各有一条横幅列出受影响章节,合成页提供「重做受影响章节」显式按钮
   —— **只提示,不自动重做**。旧版后端不返回该字段时前端按空数组容错。

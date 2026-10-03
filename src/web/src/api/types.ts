@@ -241,6 +241,12 @@ export interface UploadProjectRequest {
   files: File[]
 }
 
+/** 删除工程(api/design.md §8.10):目录移入回收站,不真删 */
+export interface DeleteProjectResult {
+  deleted: string
+  trashed_to: string
+}
+
 // --------------------------------------------------------------------------- //
 // 绑定
 // --------------------------------------------------------------------------- //

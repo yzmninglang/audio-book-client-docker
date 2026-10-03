@@ -13,6 +13,7 @@ import type {
   BindingsFile,
   CreateProjectRequest,
   CreateVoiceRequest,
+  DeleteProjectResult,
   FsBrowse,
   HealthResult,
   JobStatus,
@@ -23,8 +24,46 @@ import type {
   Settings,
   StartJobRequest,
   UpdateVoiceRequest,
+  UploadProjectRequest,
   VoiceEntry,
 } from './types'
+
+// --------------------------------------------------------------------------- //
+// 章节 JSON 上传的前端侧校验(服务端才是权威;前台先拦能少一次往返)
+// api/design.md §8.9:只接 .json、单文件 8MB、单次 200 个、总 64MB
+// --------------------------------------------------------------------------- //
+
+export const CHAPTER_FILE_LIMITS = {
+  maxFileBytes: 8 * 1024 * 1024,
+  maxCount: 200,
+  maxTotalBytes: 64 * 1024 * 1024,
+} as const
+
+function formatMB(bytes: number): string {
+  return `${Math.round((bytes / (1024 * 1024)) * 10) / 10} MB`
+}
+
+/** 校验一批待上传的章节 JSON;通过返回 null,否则返回可直接展示的错误文案 */
+export function validateChapterFiles(files: File[]): string | null {
+  if (files.length === 0) return '请至少选择一个 .json 文件'
+  if (files.length > CHAPTER_FILE_LIMITS.maxCount) {
+    return `单次最多上传 ${CHAPTER_FILE_LIMITS.maxCount} 个文件(当前 ${files.length} 个)`
+  }
+  let total = 0
+  for (const f of files) {
+    const lower = f.name.toLowerCase()
+    if (!lower.endsWith('.json')) return `只允许 .json 文件:${f.name}`
+    if (f.size === 0) return `文件为空:${f.name}`
+    if (f.size > CHAPTER_FILE_LIMITS.maxFileBytes) {
+      return `单文件不得超过 ${formatMB(CHAPTER_FILE_LIMITS.maxFileBytes)}:${f.name}(${formatMB(f.size)})`
+    }
+    total += f.size
+  }
+  if (total > CHAPTER_FILE_LIMITS.maxTotalBytes) {
+    return `总大小不得超过 ${formatMB(CHAPTER_FILE_LIMITS.maxTotalBytes)}(当前 ${formatMB(total)})`
+  }
+  return null
+}
 
 // --------------------------------------------------------------------------- //
 // 错误
@@ -166,8 +205,35 @@ export const api = {
   createProject(req: CreateProjectRequest): Promise<ProjectDetail> {
     return request<ProjectDetail>('/api/projects', json(req))
   },
+  /** 上传 JSON 建工程(multipart,字段名固定 files) */
+  uploadProject(req: UploadProjectRequest): Promise<ProjectDetail> {
+    const fd = new FormData()
+    fd.append('name', req.name)
+    for (const f of req.files) fd.append('files', f)
+    return request<ProjectDetail>('/api/projects/upload', { method: 'POST', body: fd })
+  },
+  /** 追加/替换章节(multipart,字段名固定 files;同名覆盖) */
+  appendChapters(name: string, files: File[]): Promise<ProjectDetail> {
+    const fd = new FormData()
+    for (const f of files) fd.append('files', f)
+    return request<ProjectDetail>(`/api/projects/${encodeURIComponent(name)}/chapters`, {
+      method: 'POST',
+      body: fd,
+    })
+  },
   getProject(name: string): Promise<ProjectDetail> {
     return request<ProjectDetail>(`/api/projects/${encodeURIComponent(name)}`)
+  },
+  /** 删除工程:整个目录移入 <workspace>/.trash/(不真删);正在合成 → 409 */
+  deleteProject(name: string): Promise<DeleteProjectResult> {
+    return request<DeleteProjectResult>(`/api/projects/${encodeURIComponent(name)}`, { method: 'DELETE' })
+  },
+  /** 删除章节:成品移入 audio/.stale/(不真删);该章正在合成 → 409;返回更新后的详情 */
+  deleteChapter(name: string, chapter: string): Promise<ProjectDetail> {
+    return request<ProjectDetail>(
+      `/api/projects/${encodeURIComponent(name)}/chapters/${encodeURIComponent(chapter)}`,
+      { method: 'DELETE' },
+    )
   },
 
   // -- 绑定 -------------------------------------------------------------- //

@@ -472,6 +472,19 @@ function resetSim() {
 // 路由分发
 // --------------------------------------------------------------------------- //
 
+/** 取 multipart 里 `files`(复数)字段的原始文件 */
+function uploadedFiles(init?: RequestInit): File[] {
+  const fd = init?.body instanceof FormData ? init.body : undefined
+  if (!fd) return []
+  return fd.getAll('files').filter((x): x is File => typeof x !== 'string')
+}
+
+/** 章节名 = 文件 basename 去掉 .json(与后端一致) */
+function chapterNameFromFile(name: string): string {
+  const base = name.split(/[\\/]/).pop() || name
+  return base.replace(/\.json$/i, '')
+}
+
 function parsePath(path: string): { pathname: string; query: URLSearchParams } {
   const qIndex = path.indexOf('?')
   const pathname = qIndex >= 0 ? path.slice(0, qIndex) : path
@@ -595,12 +608,51 @@ function handle(path: string, init?: RequestInit): Response {
     }
   }
 
+  // /api/projects/upload —— 上传建工程(必须在 {name} 分支之前判定)
+  if (method === 'POST' && pathname === '/api/projects/upload') {
+    const fd = init?.body instanceof FormData ? init.body : undefined
+    const name = String(fd?.get('name') || '').trim()
+    if (!name) return errorResponse('invalid', '工程名不能为空', 400)
+    if (findProject(name)) return errorResponse('invalid', `工程已存在: ${name}`, 409)
+    const files = uploadedFiles(init)
+    if (files.length === 0) return errorResponse('invalid', '未提供任何 .json 文件', 400)
+    const bad = files.find((f) => !f.name.toLowerCase().endsWith('.json'))
+    if (bad) return errorResponse('invalid', `只允许 .json 文件:${bad.name}`, 400)
+    const np: MockProject = {
+      name,
+      path: `${settings.workspace_root}/${name}`,
+      chapters: files.map((f) => ({
+        name: chapterNameFromFile(f.name),
+        sentence_count: 60,
+        status: 'pending' as const,
+        output: null,
+      })),
+      roles: ['旁白'],
+      bindings: { version: 1, bindings: {} },
+      manifestProvider: 'indextts2',
+      stale_chapters: [],
+    }
+    projects.push(np)
+    FS_TREE[np.path] = { is_project: true, dirs: ['json', 'process_audio', 'audio'] }
+    return jsonResponse(toDetail(np))
+  }
+
   if (seg[0] === 'api' && seg[1] === 'projects' && seg[2]) {
     const name = decodeURIComponent(seg[2])
     const p = findProject(name)
     // /api/projects/{name}
     if (seg.length === 3) {
       if (!p) return errorResponse('not_found', `工程不存在: ${name}`, 404)
+      if (method === 'DELETE') {
+        if (sim.status.state === 'running' && sim.status.project === name) {
+          return errorResponse('invalid', `工程正在合成,无法删除: ${name}`, 409)
+        }
+        const idx = projects.findIndex((x) => x.name === name)
+        if (idx >= 0) projects.splice(idx, 1)
+        delete FS_TREE[p.path]
+        const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15)
+        return jsonResponse({ deleted: name, trashed_to: `.trash/${name}-${stamp}` })
+      }
       return jsonResponse(toDetail(p))
     }
     // /api/projects/{name}/bindings
@@ -613,6 +665,44 @@ function handle(path: string, init?: RequestInit): Response {
         return jsonResponse(p.bindings)
       }
     }
+    // /api/projects/{name}/chapters —— 追加/替换章节(同名覆盖)
+    if (seg.length === 4 && seg[3] === 'chapters' && method === 'POST') {
+      if (!p) return errorResponse('not_found', `工程不存在: ${name}`, 404)
+      const files = uploadedFiles(init)
+      if (files.length === 0) return errorResponse('invalid', '未提供任何 .json 文件', 400)
+      const bad = files.find((f) => !f.name.toLowerCase().endsWith('.json'))
+      if (bad) return errorResponse('invalid', `只允许 .json 文件:${bad.name}`, 400)
+      const stale = [...p.stale_chapters]
+      for (const f of files) {
+        const cn = chapterNameFromFile(f.name)
+        const existing = p.chapters.find((c) => c.name === cn)
+        if (existing) {
+          // 同名覆盖:重置状态;已生成的旧音频失效(后端靠 json_sha256 变化自动作废)
+          existing.status = 'pending'
+          existing.output = null
+          if (!stale.some((s) => s.name === cn)) stale.push({ name: cn, stale_fragments: [1] })
+        } else {
+          p.chapters.push({ name: cn, sentence_count: 60, status: 'pending', output: null })
+        }
+      }
+      p.stale_chapters = stale
+      return jsonResponse(toDetail(p))
+    }
+
+    // /api/projects/{name}/chapters/{chapter} —— 删除章节(成品移入 audio/.stale/)
+    if (seg.length === 5 && seg[3] === 'chapters' && method === 'DELETE') {
+      if (!p) return errorResponse('not_found', `工程不存在: ${name}`, 404)
+      const chapter = decodeURIComponent(seg[4])
+      const ci = p.chapters.findIndex((c) => c.name === chapter)
+      if (ci < 0) return errorResponse('not_found', `章节不存在: ${chapter}`, 404)
+      if (sim.status.state === 'running' && sim.status.current_chapter === chapter) {
+        return errorResponse('invalid', `章节正在合成,无法删除: ${chapter}`, 409)
+      }
+      p.chapters.splice(ci, 1)
+      p.stale_chapters = p.stale_chapters.filter((s) => s.name !== chapter)
+      return jsonResponse(toDetail(p))
+    }
+
     // /api/projects/{name}/chapters/{ch}/audio
     if (seg.length === 6 && seg[3] === 'chapters' && seg[5] === 'audio') {
       if (!p) return errorResponse('not_found', `工程不存在: ${name}`, 404)

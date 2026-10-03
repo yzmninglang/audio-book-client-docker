@@ -226,9 +226,21 @@ data: {"state":"running"}
 {"error": {"kind": "binding", "message": "角色未绑定音色: 常伟思"}}
 ```
 
-`kind` 取自 `src/errors.py` 的异常 `kind`:`retryable` / `fatal` / `invalid` /
-`config` / `not_found` / `binding` / `manifest`。
-HTTP 状态映射:`invalid`→400、`not_found`→404、`config`/`binding`→409、其余→500。
+`kind` 取自异常类的 `kind` 属性。领域异常在 `src/errors.py`;
+**HTTP 语义专用**的异常在 `src/api/errors.py`(不污染领域层,见该文件 docstring)。
+
+| `kind` | HTTP | 含义 |
+|---|---|---|
+| `invalid` | 400 | 参数/输入不合法 |
+| `not_found` | 404 | 资源不存在 |
+| `config` | 409 | 配置冲突(如绑定失效) |
+| `binding` | 409 | 角色未绑定音色 |
+| `conflict` | 409 | **操作与进行中的任务冲突**(如删除正在合成的工程/章节) |
+| `retryable` / `fatal` / `manifest` | 500 | 内部错误 |
+
+> **两个 409 的例外**:`AlreadyExistsError`(资源已存在)继承 `InvalidInputError`,
+> `kind` 仍是 `invalid`,但错误处理器把状态码钉成 **409** —— 因为「已存在」不是"参数写错了"。
+> 这类「kind 与状态码解耦」只用于这一处,别扩散。
 
 ### 8.9 章节 JSON 上传(需求扩展,2026-10-03)
 
@@ -270,6 +282,46 @@ HTTP 状态映射:`invalid`→400、`not_found`→404、`config`/`binding`→409
 | 总大小上限 | **64 MB** | 同上 |
 | 落盘路径 | 只能落在 `<工程>/json/` 内 | 复用 `resolve_within_roots` 的同类校验思路 |
 | 工程名 | 复用 `validate_project_name` | 与既有建工程一致 |
-| 工程重名 | **409**(`invalid`) | 不静默覆盖 |
+| 工程重名 | **409**,`kind=invalid`(`AlreadyExistsError`) | 不静默覆盖;「已存在」不是"参数写错了",故状态码是 409 而非 400 |
 
 > 与 `/api/fs/browse` 是同一类问题的两面:`browse` 防的是**读**越界,上传防的是**写**越界。
+
+### 8.10 删除工程 / 删除章节(需求扩展,2026-10-03)
+
+**为什么需要**:浏览器上传加上之后,用户必然会传错、建错。若不能删,试错成本高到没法用
+(实测:用户直接丢进 workspace 的目录连"工程"都不算,却也删不掉)。
+
+**这两条都是破坏性操作,处理原则与 `audio/.stale/` 一致 —— 可恢复,不真删。**
+
+#### `DELETE /api/projects/{name}`
+
+| 项 | 规则 |
+|---|---|
+| 前置检查 | **该工程有正在运行的任务 → 409**(删到一半会产生孤儿片段) |
+| 行为 | 整个工程目录 **移到 `<workspace>/.trash/<工程名>-<YYYYmmdd-HHMMSS>/`** |
+| 返回 | `{"deleted": "<工程名>", "trashed_to": ".trash/<工程名>-<时间戳>"}` |
+| 安全 | 复用 `validate_project_name` + `resolve_within_roots`,拒绝路径穿越 |
+| 不存在 | 404 |
+
+> `.trash/` 会被工作区扫描忽略(它没有 `json/`,不是合法工程),但**会在路径浏览器里出现** —— 由用户显式清理。
+> 这与 [project/design.md §7](project/design.md#7-细节决策已定稿) 中 `.stale/`「保留,不自动清理」的决策一致。
+
+> ⚠️ **`.trash/` 必须位于 `workspace` 卷内,不要"优化"到其他位置。**
+> `os.rename()` 只在**同一文件系统内**才是原子的。放到别的卷(如 `/config`)会让"移动"退化为
+> **复制 + 删除**:工程可能含数 GB 音频,耗时长,且**中断后会得到一个撕成两半的工程**
+> (一半在新位置、一半在旧位置)。放在 workspace 卷内是让删除**原子且瞬时**的必要条件,不是图方便。
+>
+> 副作用要知道:`.trash/` **占用 workspace 卷空间** —— 删除不等于释放,需手动清理。
+
+#### `DELETE /api/projects/{name}/chapters/{chapter}`
+
+| 项 | 规则 |
+|---|---|
+| 前置检查 | **该章节正在合成 → 409** |
+| 删除 | `json/<章节>.json`、manifest 中该章记录、`process_audio/<章节>/` |
+| 成品 | `audio/<章节>.wav` **移到 `audio/.stale/`**(不真删) |
+| 返回 | 更新后的 `ProjectDetailOut` |
+| 安全 | 章节名取 `basename` 并拒绝 `/`、`\`、`..`、控制字符;必须落在 `<工程>/json/` 内 |
+| 不存在 | 404 |
+
+> 与 §8.9 的上传同名覆盖互补:**覆盖**用于"换了稿子",**删除**用于"根本不该有这一章"。

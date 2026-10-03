@@ -2,7 +2,14 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 
 import { api } from '@/api/client'
-import type { BindingsFile, CreateProjectRequest, ProjectDetail, ProjectSummary, RoleView } from '@/api/types'
+import type {
+  BindingsFile,
+  CreateProjectRequest,
+  ProjectDetail,
+  ProjectSummary,
+  RoleView,
+  UploadProjectRequest,
+} from '@/api/types'
 
 export const useProjectsStore = defineStore('projects', () => {
   const list = ref<ProjectSummary[]>([])
@@ -45,6 +52,36 @@ export const useProjectsStore = defineStore('projects', () => {
     return detail
   }
 
+  /** 上传 JSON 建工程 */
+  async function uploadCreate(req: UploadProjectRequest) {
+    const detail = await api.uploadProject(req)
+    await loadList()
+    return detail
+  }
+
+  /** 给已有工程追加/替换章节,成功后刷新当前详情 */
+  async function appendChapters(name: string, files: File[]) {
+    const detail = await api.appendChapters(name, files)
+    if (current.value?.name === name) current.value = detail
+    await loadList()
+    return detail
+  }
+
+  /** 删除工程(移入回收站);成功后从列表移除 */
+  async function deleteProject(name: string) {
+    const result = await api.deleteProject(name)
+    if (current.value?.name === name) current.value = null
+    await loadList()
+    return result
+  }
+
+  /** 删除章节(成品移入 audio/.stale/);成功后用返回详情刷新 */
+  async function deleteChapter(name: string, chapter: string) {
+    const detail = await api.deleteChapter(name, chapter)
+    if (current.value?.name === name) current.value = detail
+    return detail
+  }
+
   async function saveBindings(bindings: BindingsFile) {
     if (!current.value) throw new Error('未打开工程')
     const saved = await api.updateBindings(current.value.name, bindings)
@@ -65,6 +102,10 @@ export const useProjectsStore = defineStore('projects', () => {
     loadList,
     open,
     create,
+    uploadCreate,
+    appendChapters,
+    deleteProject,
+    deleteChapter,
     saveBindings,
   }
 })
