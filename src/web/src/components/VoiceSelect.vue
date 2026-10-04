@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 
 import type { VoiceEntry } from '@/api/types'
+import { filterVoiceNames } from '@/utils/voiceFilter'
 
 /**
  * 可搜索音色下拉框。
@@ -41,15 +42,34 @@ const danglingOption = computed(() => {
   return v
 })
 
-function onChange(value: string | null) {
-  emit('update:modelValue', value)
+/**
+ * 搜索过滤。
+ *
+ * ⚠️ 踩坑记录:Element Plus 的 `filter-method` 签名是 `(query: string) => void`
+ * —— 它**不**返回布尔值,而是要求你**自己维护被过滤的选项列表**。
+ * (Ant Design 的 `filterOption: (input, option) => boolean` 是另一种形状,
+ * 照搬过来会**静默失效**:不报错,只是列表不过滤。两个库同名概念 API 不同。)
+ */
+const filteredNames = ref<string[]>([])
+
+function applyFilter(query: string) {
+  filteredNames.value = filterVoiceNames(voiceNames.value, query)
 }
 
-function filterMethod(query: string, option?: { label?: string; value?: string }) {
-  if (!option) return false
-  const q = query.trim().toLowerCase()
-  if (!q) return true
-  return (option.label || '').toLowerCase().includes(q) || (option.value || '').toLowerCase().includes(q)
+// 音色列表异步加载:变化时重建(空 query 恢复完整列表)
+watch(voiceNames, () => applyFilter(''), { immediate: true })
+
+function filterMethod(query: string) {
+  applyFilter(query)
+}
+
+// 每次打开下拉恢复完整列表,避免上次搜索词残留
+function onVisibleChange(visible: boolean) {
+  if (visible) applyFilter('')
+}
+
+function onChange(value: string | null) {
+  emit('update:modelValue', value)
 }
 </script>
 
@@ -64,8 +84,10 @@ function filterMethod(query: string, option?: { label?: string; value?: string }
     :filter-method="filterMethod"
     class="voice-select"
     @update:model-value="onChange"
+    @visible-change="onVisibleChange"
   >
-    <!-- 失效绑定:置顶 + 高亮,提醒用户重新选择 -->
+    <!-- 失效绑定:置顶 + 高亮,提醒用户重新选择。
+         刻意放在 v-for 之外 —— 它是告警,不应被搜索词过滤掉。 -->
     <el-option
       v-if="danglingOption"
       :key="`__invalid__${danglingOption}`"
@@ -79,7 +101,7 @@ function filterMethod(query: string, option?: { label?: string; value?: string }
       </span>
     </el-option>
 
-    <el-option v-for="name in voiceNames" :key="name" :label="name" :value="name" />
+    <el-option v-for="name in filteredNames" :key="name" :label="name" :value="name" />
   </el-select>
 </template>
 

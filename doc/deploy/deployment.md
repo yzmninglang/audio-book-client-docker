@@ -19,7 +19,7 @@
 
 | 文件 | 说明 |
 |---|---|
-| `audiobook-client-1.0.0-amd64.tar` | 镜像(248MB,x86_64);`docker load` 后为 `audiobook-client:latest` |
+| `audiobook-client-1.1.0-amd64.tar` | 镜像(249MB,x86_64);`docker load` 后为 `audiobook-client:1.1.0` / `:latest` |
 | `docker-compose.yml` | NAS 用 compose(**无 `build:` 段** —— NAS 上没有源码) |
 | `README.md` | 三步部署速查 + 第一坑与排障 |
 

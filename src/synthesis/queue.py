@@ -52,6 +52,15 @@ class _Task:
     report: ReconcileReport
 
 
+def _planned_count(task: _Task) -> int:
+    """该任务本章「需生成」的片段数(续传语义:只算待跑量)。"""
+    chapter = task.project.chapter(task.name)
+    sentence_count = chapter.sentence_count if chapter is not None else 0
+    if task.report is not None:
+        return len(planned_indices(task.report.action_for(task.name), sentence_count))
+    return sentence_count
+
+
 def _force_redo(project: Project, chapter_name: str) -> None:
     """显式作废某章的旧成品与片段(见 design §6「重做章节」)。
 
@@ -174,10 +183,12 @@ class SynthesisQueue:
         )
 
         with self._lock:
-            fresh = not self._tasks
+            # 「新一批」只在队列空闲时成立。**不能**只看 `_tasks` 是否为空 ——
+            # 正在跑的那章已被 popleft,此刻 _tasks 可能为空,若据此 reset 会把
+            # 正在执行的工程状态抹掉(§8.6 的同一 bug 的另一面)。
+            fresh = self._state in (JobState.IDLE, JobState.STOPPED)
             if fresh:
                 self._reset_status_locked()
-            self._project_name = project.name
             for name in names:
                 key = (str(project.root), name)
                 if key in self._queued:
@@ -198,11 +209,9 @@ class SynthesisQueue:
                 )
                 self._queued.add(key)
 
-                chapter = project.chapter(name)
-                planned = planned_indices(report.action_for(name), chapter.sentence_count)
-                self._total += chapter.sentence_count
-                self._done += chapter.sentence_count - len(planned)
-
+            # 进度统计**不在此累加** —— 入队量 ≠ 正在跑的量。
+            # `_project_name` / `_total` / `_done` 由 worker 开始跑某工程时按该工程设置
+            # (见 `_begin_project_locked`),否则多工程排队会污染显示(design §8.6)。
             self._control.resume()
             self._ensure_worker_locked()
             self._set_state_locked(JobState.RUNNING)
@@ -249,6 +258,15 @@ class SynthesisQueue:
                 if self._state in (JobState.RUNNING, JobState.PAUSED)
                 else None
             )
+            # pending:尚未开始的任务按**入队顺序**聚合(同一工程合并计数,§8.6)。
+            pending: list[dict[str, Any]] = []
+            index: dict[str, int] = {}
+            for task in self._tasks:
+                pname = task.project.name
+                if pname not in index:
+                    index[pname] = len(pending)
+                    pending.append({"project": pname, "chapters": 0})
+                pending[index[pname]]["chapters"] += 1
             return {
                 "state": self._state.value,
                 "project": self._project_name,
@@ -258,6 +276,7 @@ class SynthesisQueue:
                 "chapters": [dict(c) for c in self._chapters.values()],
                 "eta_seconds": eta,
                 "recent_logs": list(self._logs),
+                "pending": pending,
             }
 
     @property
@@ -275,12 +294,31 @@ class SynthesisQueue:
     # -- 内部:状态 ------------------------------------------------------- #
 
     def _reset_status_locked(self) -> None:
+        self._project_name = None
         self._current_chapter = None
         self._total = 0
         self._done = 0
         self._durations = []
         self._chapters = {}
         self._logs.clear()
+
+    def _begin_project_locked(self, task: _Task) -> None:
+        """worker 开始跑某工程时,把进度作用域切到该工程(§8.6)。
+
+        切换工程 → 重置 `_done`/`_total`/`_chapters`/`_durations`;
+        `_total` = 当前任务 + 队列中**同工程**任务的待跑量之和。
+        """
+        name = task.project.name
+        if name == self._project_name:
+            return  # 同工程后续章节:总量已在切换时预扫
+        self._project_name = name
+        self._done = 0
+        self._durations = []
+        self._chapters = {}
+        self._total = _planned_count(task)
+        for queued in self._tasks:
+            if queued.project.name == name:
+                self._total += _planned_count(queued)
 
     def _set_state_locked(self, state: JobState) -> None:
         self._state = state
@@ -312,10 +350,12 @@ class SynthesisQueue:
                         self._set_state_locked(JobState.PAUSED)
                         return
                     if not self._tasks:
+                        self._project_name = None  # 空闲:不再指向任何工程
                         self._set_state_locked(JobState.IDLE)
                         return
                     task = self._tasks.popleft()
                     self._queued.discard((str(task.project.root), task.name))
+                    self._begin_project_locked(task)  # 进度作用域切到该任务所属工程
                 self._run_task(task)
         finally:
             with self._lock:

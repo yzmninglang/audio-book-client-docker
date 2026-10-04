@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from datetime import UTC, datetime
+from datetime import datetime
 
 from fastapi import APIRouter, Request, Response
 from starlette.datastructures import FormData, UploadFile
@@ -348,7 +348,12 @@ def _safe_chapter_name(raw: str) -> str:
 
 
 def _timestamp() -> str:
-    return datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    """本地时间戳(`TZ` 环境变量,如 Asia/Shanghai)。
+
+    用户是在 NAS 文件管理器里看 `.trash/<名>-<时间戳>` 对账的,
+    必须与日志/宿主本地时间一致,**不要**用 UTC。
+    """
+    return datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
 
 
 def _unique_path(dest):

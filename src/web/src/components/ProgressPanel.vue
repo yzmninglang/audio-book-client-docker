@@ -86,6 +86,11 @@ const levelType: Record<string, 'info' | 'warning' | 'danger' | 'primary'> = {
           <span :class="{ 'pp-failed': row.failed > 0 }">{{ row.failed }}</span>
         </template>
       </el-table-column>
+      <el-table-column v-if="$slots['row-actions']" label="操作" width="190">
+        <template #default="{ row }">
+          <slot name="row-actions" :row="row" />
+        </template>
+      </el-table-column>
     </el-table>
 
     <div class="pp-logs">

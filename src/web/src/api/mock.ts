@@ -350,24 +350,49 @@ function findProject(name: string): MockProject | undefined {
 // 任务模拟(SSE)
 // --------------------------------------------------------------------------- //
 
+/** 排队中的任务(尚未开始) */
+interface SimTask {
+  project: string
+  chapters: string[]
+  count: number
+}
+
+/** 正在执行的工程:remaining 是尚未开始的章节,current 是正在跑的章节 */
+interface ActiveTask {
+  project: string
+  remaining: { chapter: string; total: number }[]
+  current: { chapter: string; total: number; done: number; failed: number } | null
+}
+
 interface SimState {
   status: JobStatus
   timer: ReturnType<typeof setInterval> | null
-  queue: { chapter: string; total: number }[]
-  current: { chapter: string; total: number; done: number; failed: number } | null
+  /** FIFO 队列(排队中,尚未开始) */
+  queue: SimTask[]
+  active: ActiveTask | null
 }
 
 const listeners = new Set<(payload: ProgressEvent) => void>()
 
+const blankStatus = (state: JobStatus['state']): JobStatus => ({
+  state,
+  project: null,
+  current_chapter: null,
+  done_fragments: 0,
+  total_fragments: 0,
+  chapters: [],
+  pending: [],
+  recent_logs: [],
+})
+
 const sim: SimState = {
-  status: { state: 'idle', project: null, current_chapter: null, done_fragments: 0, total_fragments: 0, chapters: [], recent_logs: [] },
+  status: blankStatus('idle'),
   timer: null,
   queue: [],
-  current: null,
+  active: null,
 }
 
 function emit(payload: ProgressEvent) {
-  sim.status.recent_logs = sim.status.recent_logs || []
   for (const l of listeners) l(payload)
 }
 
@@ -387,21 +412,71 @@ function stopTimer() {
   }
 }
 
+function updatePending() {
+  sim.status.pending = sim.queue.map((t) => ({ project: t.project, chapters: t.count }))
+}
+
+/** 某工程已排入(运行中或排队中)的章节名,用于幂等去重 */
+function scheduledSet(project: string): Set<string> {
+  const s = new Set<string>()
+  for (const t of sim.queue) if (t.project === project) for (const c of t.chapters) s.add(c)
+  if (sim.active?.project === project) {
+    for (const r of sim.active.remaining) s.add(r.chapter)
+    if (sim.active.current) s.add(sim.active.current.chapter)
+  }
+  return s
+}
+
 function tick() {
   if (sim.status.state !== 'running') return
-  const cur = sim.current
-  if (!cur) {
+
+  // 无正在执行的工程 -> 从队列取下一个(FIFO)
+  if (!sim.active) {
     const next = sim.queue.shift()
+    updatePending()
     if (!next) {
-      // 全部完成
       sim.status.state = 'idle'
+      sim.status.project = null
       sim.status.current_chapter = null
-      pushLog('info', '全部章节完成')
+      sim.status.done_fragments = 0
+      sim.status.total_fragments = 0
+      sim.status.chapters = []
+      pushLog('info', '队列已清空,全部完成')
       emit({ type: 'job_state', state: 'idle' })
       stopTimer()
       return
     }
-    sim.current = { chapter: next.chapter, total: next.total, done: 0, failed: 0 }
+    const p = findProject(next.project)
+    if (!p) return
+    const targets = next.chapters.length ? p.chapters.filter((c) => next.chapters.includes(c.name)) : p.chapters
+    const toRun = targets.filter((c) => c.status !== 'done')
+    if (!toRun.length) return
+    sim.active = {
+      project: next.project,
+      remaining: toRun.map((c) => ({ chapter: c.name, total: c.sentence_count })),
+      current: null,
+    }
+    // 只有「正在执行」的工程才写进 status.project(修复:不再被最后入队的覆盖)
+    sim.status.project = next.project
+    sim.status.current_chapter = null
+    sim.status.done_fragments = 0
+    sim.status.total_fragments = toRun.reduce((s, c) => s + c.sentence_count, 0)
+    sim.status.chapters = []
+    pushLog('info', `开始合成「${next.project}」,待生成 ${sim.status.total_fragments} 条`)
+    emit({ type: 'job_state', state: 'running' })
+    return
+  }
+
+  const act = sim.active
+  if (!act.current) {
+    const next = act.remaining.shift()
+    if (!next) {
+      // 本工程跑完,下一 tick 取队列中的下一个工程
+      sim.active = null
+      sim.status.current_chapter = null
+      return
+    }
+    act.current = { chapter: next.chapter, total: next.total, done: 0, failed: 0 }
     sim.status.current_chapter = next.chapter
     const cp: ChapterProgress = { name: next.chapter, total: next.total, done: 0, failed: 0, status: 'synthesizing' }
     sim.status.chapters = [...(sim.status.chapters?.filter((c) => c.name !== next.chapter) || []), cp]
@@ -410,6 +485,7 @@ function tick() {
   }
 
   // 逐条推进(约 500ms 一条,模拟片段完成粒度)
+  const cur = act.current
   cur.done += 1
   sim.status.done_fragments = (sim.status.done_fragments || 0) + 1
   const cp = sim.status.chapters?.find((c) => c.name === cur.chapter)
@@ -429,43 +505,60 @@ function tick() {
       ch.status = 'done'
       ch.output = out
     }
-    sim.status.current_chapter = null
-    sim.current = null
+    act.current = null
   }
 }
 
+/** 提交任务:运行中亦可入队(FIFO),不覆盖正在执行的工程 */
 function startSim(projectName: string, chapters: string[]) {
   const p = findProject(projectName)
   if (!p) return
+  const scheduled = scheduledSet(projectName)
   const targets = chapters.length ? p.chapters.filter((c) => chapters.includes(c.name)) : p.chapters
-  const toRun = targets.filter((c) => c.status !== 'done')
-  sim.status = {
-    state: 'running',
-    project: projectName,
-    current_chapter: null,
-    done_fragments: 0,
-    total_fragments: toRun.reduce((s, c) => s + c.sentence_count, 0),
-    chapters: [],
-    recent_logs: sim.status.recent_logs?.slice(-50) || [],
+  const toRun = targets.filter((c) => c.status !== 'done' && !scheduled.has(c.name))
+  if (!toRun.length) {
+    pushLog('info', `「${projectName}」没有需要生成的章节(已完成或已在队列中)`)
+    return
   }
-  sim.current = null
-  sim.queue = toRun.map((c) => ({ chapter: c.name, total: c.sentence_count }))
-
+  sim.queue.push({ project: projectName, chapters: toRun.map((c) => c.name), count: toRun.length })
+  updatePending()
   const unbound = rolesOf(p).filter((r) => r.status !== 'ok')
   if (unbound.length) {
-    pushLog('warn', `有 ${unbound.length} 个角色未绑定或绑定失效,后端将在开跑前阻塞: ${unbound.map((r) => r.name).join('、')}`)
+    pushLog(
+      'warn',
+      `「${projectName}」有 ${unbound.length} 个角色未绑定或绑定失效,后端将在开跑前阻塞: ${unbound.map((r) => r.name).join('、')}`,
+    )
   }
-  emit({ type: 'job_state', state: 'running' })
-  pushLog('info', `开始合成「${projectName}」,待生成 ${sim.status.total_fragments} 条`)
+  pushLog('info', `已加入队列:「${projectName}」${toRun.length} 章`)
+
+  if (sim.status.state !== 'running') {
+    sim.status.state = 'running'
+    emit({ type: 'job_state', state: 'running' })
+  }
+  if (!sim.timer) sim.timer = setInterval(tick, 500)
+}
+
+function pauseSim() {
+  if (sim.status.state !== 'running') return
+  sim.status.state = 'paused'
+  pushLog('warn', '已暂停(当前片段跑完后停)')
+  emit({ type: 'job_state', state: 'paused' })
+}
+
+function stopSim() {
   stopTimer()
-  sim.timer = setInterval(tick, 500)
+  sim.active = null
+  sim.queue = []
+  sim.status = blankStatus('stopped')
+  pushLog('warn', '已停止,清空未开始任务')
+  emit({ type: 'job_state', state: 'stopped' })
 }
 
 function resetSim() {
   stopTimer()
-  sim.current = null
+  sim.active = null
   sim.queue = []
-  sim.status = { state: 'idle', project: null, current_chapter: null, done_fragments: 0, total_fragments: 0, chapters: [], recent_logs: [] }
+  sim.status = blankStatus('idle')
 }
 
 // --------------------------------------------------------------------------- //
@@ -779,19 +872,11 @@ function handle(path: string, init?: RequestInit): Response {
     return jsonResponse(sim.status)
   }
   if (pathname === '/api/jobs/pause' && method === 'POST') {
-    if (sim.status.state === 'running') {
-      sim.status.state = 'paused'
-      pushLog('warn', '已暂停(当前片段跑完后停)')
-      emit({ type: 'job_state', state: 'paused' })
-    }
+    pauseSim()
     return jsonResponse(sim.status)
   }
   if (pathname === '/api/jobs/stop' && method === 'POST') {
-    sim.status.state = 'stopped'
-    sim.queue = []
-    pushLog('warn', '已停止,清空未开始任务')
-    emit({ type: 'job_state', state: 'stopped' })
-    stopTimer()
+    stopSim()
     return jsonResponse(sim.status)
   }
 

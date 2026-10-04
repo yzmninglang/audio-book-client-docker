@@ -108,6 +108,12 @@ grep -rl "__AUDIOBOOK_MOCK_MARKER__" dist/ && echo "!! mock 泄漏进产物" || 
 - **绑定变更提示**:`GET /api/projects/{name}` 返回 `stale_chapters`(片段基于旧绑定生成的章节)。
   角色绑定页与合成进度页各有一条横幅列出受影响章节,合成页提供「重做受影响章节」显式按钮
   —— **只提示,不自动重做**。旧版后端不返回该字段时前端按空数组容错。
+- **进度分两块,不混用**(`api/design.md §8.6`):
+  - **本工程进度**:取自该工程自身数据(`GET /api/projects/{name}` 各章的 `sentence_count` /
+    `done_fragments` / `failed_fragments`);正在执行的正是本工程时叠加实时值。
+  - **全局队列**:「正在运行: X · 章节」+「排队中: [Y, Z]」,取自 `GET /api/jobs/state`
+    (`project` 是**正在执行**的工程,`pending` 是 FIFO 队列)。
+  队列须为**进程级全局单例**(多设备共享),提交按钮在运行中**不禁用**,文案变「加入队列」。
 - **进度** 走 SSE(`GET /api/jobs/events`);后端按**具名事件**发送(`event: <type>`),
   前端同时兼容默认 message 事件;重连时先 `GET /api/jobs/state` 补齐再订阅增量;
   页面刷新不影响后端任务,重连即恢复视图。

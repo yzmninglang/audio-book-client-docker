@@ -513,6 +513,13 @@ def test_jobs_state_pause_stop(client: TestClient, project_env):
     client.app.state.queue.wait_idle(timeout=10.0)
 
 
+def test_job_state_includes_pending(client: TestClient):
+    body = client.get("/api/jobs/state").json()
+    assert body["pending"] == []
+    assert body["project"] is None
+    assert body["state"] == "idle"
+
+
 def test_start_job_unknown_project_is_404(client: TestClient):
     resp = client.post("/api/jobs", json={"project": "不存在"})
     assert resp.status_code == 404
@@ -1024,3 +1031,24 @@ def test_delete_chapter_bad_name_rejected(
     assert resp.status_code in (400, 404, 405), f"{bad!r} 未被拒: {resp.status_code}"
     assert sorted(p.name for p in (root / "json").iterdir()) == before  # 卷内未变
     assert not (tmp_path / "evil").exists()  # 卷外无改动
+
+
+def test_delete_project_trash_timestamp_is_local_time(client: TestClient, tmp_path: Path):
+    """`.trash/<名>-<YYYYmmdd-HHMMSS>` 的时间戳必须是**本地时间**(与 TZ/日志一致,非 UTC)。"""
+    from datetime import datetime
+
+    client.post(
+        "/api/projects/upload",
+        data={"name": "时间书"},
+        files=_files(("A.json", _chap([("甲", "a")]))),
+    )
+    resp = client.delete("/api/projects/时间书")
+    assert resp.status_code == 200, resp.text
+    dirname = resp.json()["trashed_to"].split("/")[-1]
+    ts_str = dirname[-15:]  # YYYYmmdd-HHMMSS
+    parsed = datetime.strptime(ts_str, "%Y%m%d-%H%M%S")
+
+    now = datetime.now()  # 本地时间(TZ 生效)
+    assert parsed.date() == now.date()
+    assert abs((now - parsed).total_seconds()) <= 120, f"时间戳偏离本地时间: {ts_str} vs {now}"
+    assert parsed.hour == now.hour  # 同小时

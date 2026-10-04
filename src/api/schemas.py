@@ -243,8 +243,16 @@ class LogEntryOut(BaseModel):
     ts: str | None = None
 
 
+class PendingProjectOut(BaseModel):
+    """排队中(尚未开始)的工程,按入队顺序(§8.6)。`chapters` 为待跑章节数。"""
+
+    project: str
+    chapters: int = 0
+
+
 class JobStatusOut(BaseModel):
     state: str  # idle | running | paused | stopped
+    # 以下进度字段**只属于"正在执行的那个工程"**,不是"最后入队的"(§8.6)。
     project: str | None = None
     current_chapter: str | None = None
     done_fragments: int = 0
@@ -252,6 +260,8 @@ class JobStatusOut(BaseModel):
     chapters: list[ChapterProgressOut] = Field(default_factory=list)
     eta_seconds: int | None = None
     recent_logs: list[LogEntryOut] = Field(default_factory=list)
+    # 排队中的工程(尚未开始),按入队顺序。
+    pending: list[PendingProjectOut] = Field(default_factory=list)
 
 
 class StartJobRequest(BaseModel):

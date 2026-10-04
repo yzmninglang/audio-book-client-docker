@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted } from 'vue'
+import { computed, onMounted, onUnmounted, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 import ProgressPanel from '@/components/ProgressPanel.vue'
 import { ApiError } from '@/api/client'
-import type { StaleChapter } from '@/api/types'
+import type { ChapterProgress, StaleChapter } from '@/api/types'
 import { useJobsStore } from '@/stores/jobs'
 import { useProjectsStore } from '@/stores/projects'
 
@@ -16,8 +16,8 @@ const router = useRouter()
 const jobs = useJobsStore()
 const projects = useProjectsStore()
 
-const { status, logs, connected, reconnecting, chapters, doneFragments, totalFragments, etaLabel } =
-  storeToRefs(jobs)
+// 全局队列状态(仅用于「全局队列」那一块,不用于本工程进度)
+const { status, logs, connected, reconnecting } = storeToRefs(jobs)
 
 const stateLabel = computed(
   () =>
@@ -28,33 +28,64 @@ const stateLabel = computed(
 const unboundCount = computed(() => projects.unboundRoles.length)
 const invalidCount = computed(() => projects.invalidRoles.length)
 
+// ---- 本工程进度:一律来自工程自身数据(修复「看到的是别的工程的进度」) ----
+const thisProjectRunning = computed(() => jobs.status.project === props.name)
+
+const displayedChapters = computed<ChapterProgress[]>(() => {
+  const base: ChapterProgress[] = (projects.current?.chapters || []).map((c) => ({
+    name: c.name,
+    total: c.sentence_count,
+    done: c.done_fragments ?? 0,
+    failed: c.failed_fragments ?? 0,
+    status: c.status,
+  }))
+  // 仅当「正在执行的正是本工程」时叠加实时进度。
+  // 契约(§8.6)保证全局队列里的 chapters 属于正在执行的那个工程,所以此叠加是安全的。
+  if (thisProjectRunning.value) {
+    return base.map((b) => {
+      const live = jobs.chapters.find((x) => x.name === b.name)
+      return live ? { ...b, done: live.done, failed: live.failed, status: live.status } : b
+    })
+  }
+  return base
+})
+
+const projectTotal = computed(() => displayedChapters.value.reduce((s, c) => s + c.total, 0))
+const projectDone = computed(() => displayedChapters.value.reduce((s, c) => s + c.done, 0))
+const liveCurrentChapter = computed(() => (thisProjectRunning.value ? jobs.runningChapter : null))
+const liveEta = computed(() => (thisProjectRunning.value ? jobs.etaLabel : ''))
+
+// ---- 全局队列 ----
+const queueRunning = computed(() => jobs.status.project)
+const queueChapter = computed(() => jobs.runningChapter)
+const queuePending = computed(() => jobs.pending)
+
 /** 绑定变更后「片段基于旧音色」的章节;旧版后端不返回该字段时按空数组容错 */
 const staleChapters = computed<StaleChapter[]>(() => projects.current?.stale_chapters || [])
 const staleDescription = computed(() =>
   staleChapters.value.map((c) => `${c.name}(${c.stale_fragments.length} 条)`).join('、'),
 )
 
-const chapterStatusText: Record<string, string> = {
-  done: '已完成',
-  partial: '部分完成',
-  pending: '待生成',
-}
-function chapterStatusLabel(status: string): string {
-  return chapterStatusText[status] || status
+function refreshProject() {
+  return projects.open(props.name).catch(() => undefined)
 }
 
 onMounted(async () => {
-  try {
-    await projects.open(props.name)
-  } catch {
-    /* 详情失败不阻塞进度 */
-  }
+  await refreshProject()
   await jobs.connect()
 })
 
 onUnmounted(() => {
   jobs.disconnect()
 })
+
+// 任务离开运行时刷新一次本工程详情(补上最终章节状态)
+watch(
+  () => jobs.state,
+  (nv) => {
+    if (nv !== 'running') refreshProject()
+  },
+)
 
 async function startAll() {
   const problems: string[] = []
@@ -72,18 +103,20 @@ async function startAll() {
       return
     }
   }
+  const wasRunning = jobs.state === 'running'
   try {
     await jobs.start({ project: props.name })
-    ElMessage.success('已开始合成(只补未完成部分)')
+    ElMessage.success(wasRunning ? '已加入队列(排在当前任务之后)' : '已开始合成(只补未完成部分)')
   } catch (err) {
     ElMessage.error(err instanceof ApiError ? err.message : String(err))
   }
 }
 
 async function startChapter(chapter: string) {
+  const wasRunning = jobs.state === 'running'
   try {
     await jobs.start({ project: props.name, chapters: [chapter] })
-    ElMessage.success(`已开始章节:${chapter}`)
+    ElMessage.success(wasRunning ? `已加入队列:${chapter}` : `已开始章节:${chapter}`)
   } catch (err) {
     ElMessage.error(err instanceof ApiError ? err.message : String(err))
   }
@@ -183,93 +216,85 @@ async function stop() {
       <template #default>
         <div class="stale-body">
           <span>受影响章节:{{ staleDescription }}</span>
-          <el-button
-            size="small"
-            type="warning"
-            plain
-            :disabled="status.state === 'running'"
-            @click="redoStale"
-          >
-            重做受影响章节
-          </el-button>
+          <el-button size="small" type="warning" plain @click="redoStale">重做受影响章节</el-button>
           <span class="muted">仅提示,不会自动重做</span>
         </div>
       </template>
     </el-alert>
 
-    <div class="toolbar">
-      <el-button
-        type="primary"
-        :disabled="status.state === 'running'"
-        @click="startAll"
-      >
-        <el-icon><VideoPlay /></el-icon>&nbsp;全部开始
-      </el-button>
-      <el-button :disabled="status.state !== 'running'" @click="pause">
-        <el-icon><VideoPause /></el-icon>&nbsp;暂停
-      </el-button>
-      <el-button :disabled="status.state === 'idle' || status.state === 'stopped'" @click="stop">
-        <el-icon><SwitchButton /></el-icon>&nbsp;停止
-      </el-button>
-    </div>
-
+    <!-- 全局队列(所有工程共享);提交按钮不再因运行中而禁用 —— 支持排队 -->
     <el-card shadow="never" class="mb">
-      <ProgressPanel
-        :chapters="chapters"
-        :logs="logs"
-        :done-fragments="doneFragments"
-        :total-fragments="totalFragments"
-        :current-chapter="status.current_chapter"
-        :eta-label="etaLabel"
-        :state-label="stateLabel"
-      />
+      <template #header>全局队列(所有工程共享,串行执行)</template>
+      <div class="queue-row">
+        <span class="queue-label">正在运行</span>
+        <template v-if="queueRunning">
+          <el-tag type="primary" effect="dark">{{ queueRunning }}</el-tag>
+          <span v-if="queueChapter" class="muted">· {{ queueChapter }}</span>
+          <el-tag v-if="thisProjectRunning" size="small" type="success" effect="plain">本工程</el-tag>
+        </template>
+        <span v-else class="muted">空闲</span>
+      </div>
+      <div class="queue-row">
+        <span class="queue-label">排队中</span>
+        <template v-if="queuePending.length">
+          <el-tag v-for="(p, i) in queuePending" :key="p.project + i" type="info" effect="plain" class="queue-chip">
+            {{ i + 1 }}. {{ p.project }}({{ p.chapters }} 章)
+          </el-tag>
+        </template>
+        <span v-else class="muted">无</span>
+      </div>
+      <div class="queue-controls">
+        <el-button type="primary" @click="startAll">
+          <el-icon><VideoPlay /></el-icon>&nbsp;{{ status.state === 'running' ? '加入队列' : '全部开始' }}
+        </el-button>
+        <el-button :disabled="status.state !== 'running'" @click="pause">
+          <el-icon><VideoPause /></el-icon>&nbsp;暂停
+        </el-button>
+        <el-button :disabled="status.state === 'idle' || status.state === 'stopped'" @click="stop">
+          <el-icon><SwitchButton /></el-icon>&nbsp;停止
+        </el-button>
+      </div>
     </el-card>
 
+    <!-- 本工程进度:来自工程自身数据,与全局队列无关 -->
     <el-card shadow="never">
-      <template #header>章节清单</template>
-      <el-table :data="projects.current?.chapters || []" size="small" empty-text="无章节">
-        <el-table-column prop="name" label="章节" min-width="160" />
-        <el-table-column prop="sentence_count" label="句数" width="90" />
-        <el-table-column label="状态" width="110">
-          <template #default="{ row }">
-            <el-tag
-              size="small"
-              :type="row.status === 'done' ? 'success' : row.status === 'partial' ? 'danger' : 'info'"
-            >
-              {{ chapterStatusLabel(row.status) }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column prop="output" label="成品路径" min-width="180">
-          <template #default="{ row }">{{ row.output || '—' }}</template>
-        </el-table-column>
-        <el-table-column label="操作" width="180">
-          <template #default="{ row }">
-            <el-button
-              size="small"
-              text
-              type="primary"
-              :disabled="status.state === 'running'"
-              @click="startChapter(row.name)"
-            >
-              {{ row.status === 'done' ? '重做' : '开始此章' }}
-            </el-button>
-            <el-tooltip :disabled="jobs.runningChapter !== row.name" content="该章正在合成,无法删除">
-              <span>
-                <el-button
-                  size="small"
-                  text
-                  type="danger"
-                  :disabled="jobs.runningChapter === row.name"
-                  @click="removeChapter(row.name)"
-                >
-                  删除
-                </el-button>
-              </span>
-            </el-tooltip>
-          </template>
-        </el-table-column>
-      </el-table>
+      <template #header>
+        本工程进度 <span class="muted">— 来自本工程数据({{ projectDone }} / {{ projectTotal }} 条)</span>
+      </template>
+      <ProgressPanel
+        :chapters="displayedChapters"
+        :logs="logs"
+        :done-fragments="projectDone"
+        :total-fragments="projectTotal"
+        :current-chapter="liveCurrentChapter"
+        :eta-label="liveEta"
+        :state-label="stateLabel"
+      >
+        <template #row-actions="{ row }">
+          <el-button
+            size="small"
+            text
+            type="primary"
+            :disabled="jobs.runningChapter === row.name"
+            @click="startChapter(row.name)"
+          >
+            {{ row.status === 'done' ? '重做' : '开始此章' }}
+          </el-button>
+          <el-tooltip :disabled="jobs.runningChapter !== row.name" content="该章正在合成,无法删除">
+            <span>
+              <el-button
+                size="small"
+                text
+                type="danger"
+                :disabled="jobs.runningChapter === row.name"
+                @click="removeChapter(row.name)"
+              >
+                删除
+              </el-button>
+            </span>
+          </el-tooltip>
+        </template>
+      </ProgressPanel>
     </el-card>
   </div>
 </template>
@@ -282,6 +307,27 @@ async function stop() {
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-wrap: wrap;
+}
+.queue-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.queue-label {
+  color: var(--el-text-color-secondary);
+  width: 72px;
+  flex: none;
+}
+.queue-chip {
+  margin-right: 4px;
+}
+.queue-controls {
+  margin-top: 6px;
+  display: flex;
+  gap: 8px;
   flex-wrap: wrap;
 }
 </style>

@@ -192,16 +192,34 @@ src/api/app.py
 
 ### 8.6 `GET /api/jobs/state` 响应体
 
+**队列语义(2026-10-03 修正)**:队列是**进程级全局单例**,允许多个工程先后入队,
+按**提交顺序 FIFO** 执行;同一 `(工程, 章节)` 幂等去重。
+
 ```json
-{"state": "running", "project": "三体", "current_chapter": "P01_扉页",
+{"state": "running",
+ "project": "三体", "current_chapter": "P01_扉页",
  "done_fragments": 42, "total_fragments": 103,
  "chapters": [{"name": "P01_扉页", "status": "synthesizing",
                "done": 42, "total": 103, "failed": 0}],
- "eta_seconds": 183, "recent_logs": [{"level": "warn", "message": "..."}]}
+ "eta_seconds": 183,
+ "pending": [{"project": "西瓜书", "chapters": 17}],
+ "recent_logs": [{"level": "warn", "message": "..."}]}
 ```
 
-`state` ∈ `idle` / `running` / `paused` / `stopped`(与 `models.JobState` 一致)。
-`eta_seconds` 可为 `null` —— 前端会退化为「剩余条数 × 3s」本地估算。
+| 字段 | 语义 |
+|---|---|
+| `state` | `idle` / `running` / `paused` / `stopped`(与 `models.JobState` 一致) |
+| `project` / `current_chapter` / `done_fragments` / `total_fragments` / `chapters` / `eta_seconds` | **全部是「正在执行的那个工程」的**,不是"最后入队的工程" |
+| `pending` | **排队中**(尚未开始)的工程,按入队顺序;`chapters` 是该工程待跑章节数 |
+
+> ⚠️ **曾经的 bug**:`_project_name` 在每次入队时被覆盖 → A 在跑时入队 B,状态会显示"正在运行 B"。
+> 必须改为记录**当前正在执行的**任务所属工程。
+>
+> ⚠️ `pending` 里的工程进度**不在这个接口里** —— 未开始的工程没有"进行中进度"。
+> 前端展示某工程的完成度时,应取该工程自己的 manifest 状态(`GET /api/projects/{name}`),
+> **不要**用全局队列的数字。这是"B 在跑、你在看 A 的页面却看到 B 的进度"的根因。
+>
+> `eta_seconds` 可为 `null` —— 前端会退化为「剩余条数 × 3s」本地估算。
 
 ### 8.7 SSE 帧格式(`GET /api/jobs/events`)
 

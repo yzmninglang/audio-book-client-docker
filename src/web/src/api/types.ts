@@ -314,16 +314,30 @@ export interface LogEntry {
   ts?: string
 }
 
+/** 排队中(尚未开始)的任务(api/design.md §8.6) */
+export interface PendingJob {
+  project: string
+  /** 该工程待跑章节数 */
+  chapters: number
+}
+
+/**
+ * 全局队列状态(api/design.md §8.6)。
+ * ⚠️ `project` / `current_chapter` / `done_fragments` / `total_fragments` / `chapters` / `eta_seconds`
+ * 全部是「正在执行的那个工程」的,不是「最后入队的工程」。
+ * 展示某个工程的完成度时用 `GET /api/projects/{name}` 的数据,**不要**用这里的数字。
+ */
 export interface JobStatus {
   state: JobState
+  /** 正在【执行】的工程 */
   project?: string | null
   current_chapter?: string | null
-  /** 全局:已完成 / 总条数(用于总进度条) */
   done_fragments?: number
   total_fragments?: number
   chapters?: ChapterProgress[]
-  /** [约定] ETA 秒(后端粗估);缺失时前端按实测均值本地估算 */
   eta_seconds?: number | null
+  /** 排队中的工程,FIFO */
+  pending?: PendingJob[]
   recent_logs?: LogEntry[]
 }
 

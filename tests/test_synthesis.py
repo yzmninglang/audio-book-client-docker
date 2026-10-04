@@ -549,11 +549,79 @@ def test_snapshot_shape(tmp_path: Path) -> None:
     queue = _run(project, voices, FakeProvider())
     snap = queue.snapshot()
     assert snap["state"] == "idle"
-    assert snap["project"] == "三体"
+    # 空闲:不指向任何工程,pending 清空(§8.6)
+    assert snap["project"] is None
+    assert snap["pending"] == []
     assert snap["total_fragments"] == 3
     assert snap["done_fragments"] == 3
     assert snap["eta_seconds"] is None  # 空闲不预估
     assert snap["chapters"][0]["status"] == "done"
+
+
+def test_queue_snapshot_scopes_to_running_project(tmp_path: Path) -> None:
+    """多工程排队:进度字段只反映**正在执行**的工程,而非最后入队的(§8.6)。"""
+    project_a, voices_a = make_project(tmp_path / "a", n=2, book="工程甲")
+    project_b, voices_b = make_project(tmp_path / "b", n=3, book="工程乙")
+    queue = SynthesisQueue()
+    snaps: list[dict] = []
+    provider = FakeProvider("fake")
+    enqueued = {"b": False}
+
+    def on_call(req, n):  # 甲的第一次合成时,入队乙(确保乙在甲运行期间排队)
+        snaps.append(queue.snapshot())
+        if not enqueued["b"]:
+            enqueued["b"] = True
+            queue.enqueue_chapters(project_b, None, provider=provider, voices=voices_b)
+
+    provider.on_call = on_call
+    queue.enqueue_chapters(project_a, None, provider=provider, voices=voices_a)
+    assert queue.wait_idle(30)
+
+    a_snaps = [s for s in snaps if s["project"] == "工程甲"]
+    b_snaps = [s for s in snaps if s["project"] == "工程乙"]
+    assert a_snaps and b_snaps, "未观察到两个工程的进度作用域切换"
+    # 甲运行期间:总量是甲的量(2),且 pending 含乙
+    assert all(s["total_fragments"] == 2 for s in a_snaps)
+    assert any(any(p["project"] == "工程乙" for p in s["pending"]) for s in a_snaps)
+    # 乙运行期间:总量是乙的量(3),done 从 0 重计(不累加甲的 2)
+    assert all(s["total_fragments"] == 3 for s in b_snaps)
+    assert all(s["done_fragments"] <= 3 for s in b_snaps)
+    assert b_snaps[0]["done_fragments"] == 0
+
+    # ★ 进度计数器必须**真的递增**(快照在每次 synthesize 前采集,故甲应为 0,1)
+    #   此前这里只断言 `<= 3` —— done 恒为 0 也能通过,证明不了计数器是好的。
+    assert [s["done_fragments"] for s in a_snaps] == [0, 1]
+    assert [s["done_fragments"] for s in b_snaps] == [0, 1, 2]
+
+    end = queue.snapshot()
+    assert end["state"] == "idle"
+    assert end["project"] is None
+    assert end["pending"] == []
+
+
+def test_queue_pending_fifo_order_and_idempotent(tmp_path: Path) -> None:
+    """pending 按入队顺序聚合;同一 (工程,章节) 重复入队幂等。"""
+    project_a, voices_a = make_project(tmp_path / "a", n=2, book="甲")
+    project_b, voices_b = make_project(tmp_path / "b", n=1, book="乙")
+    project_c, voices_c = make_project(tmp_path / "c", n=1, book="丙")
+    queue = SynthesisQueue()
+    provider = FakeProvider("fake")
+    captured: dict[str, list] = {}
+
+    def on_call(req, n):
+        if "pending" in captured:
+            return
+        queue.enqueue_chapters(project_b, None, provider=provider, voices=voices_b)
+        queue.enqueue_chapters(project_b, None, provider=provider, voices=voices_b)  # 幂等
+        queue.enqueue_chapters(project_c, None, provider=provider, voices=voices_c)
+        captured["pending"] = queue.snapshot()["pending"]
+
+    provider.on_call = on_call
+    queue.enqueue_chapters(project_a, None, provider=provider, voices=voices_a)
+    assert queue.wait_idle(30)
+
+    assert [p["project"] for p in captured["pending"]] == ["乙", "丙"]  # FIFO
+    assert [p["chapters"] for p in captured["pending"]] == [1, 1]  # 乙去重后仅 1 章
 
 
 def test_reference_audio_cached_within_chapter(tmp_path: Path) -> None:

@@ -2,7 +2,15 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 
 import { api } from '@/api/client'
-import type { ChapterProgress, JobState, JobStatus, LogEntry, ProgressEvent, StartJobRequest } from '@/api/types'
+import type {
+  ChapterProgress,
+  JobState,
+  JobStatus,
+  LogEntry,
+  PendingJob,
+  ProgressEvent,
+  StartJobRequest,
+} from '@/api/types'
 
 function emptyStatus(): JobStatus {
   return {
@@ -12,6 +20,7 @@ function emptyStatus(): JobStatus {
     done_fragments: 0,
     total_fragments: 0,
     chapters: [],
+    pending: [],
     recent_logs: [],
   }
 }
@@ -39,6 +48,8 @@ export const useJobsStore = defineStore('jobs', () => {
   const runningChapter = computed(() =>
     state.value === 'running' ? status.value.current_chapter ?? null : null,
   )
+  /** 排队中(尚未开始)的任务,FIFO */
+  const pending = computed<PendingJob[]>(() => status.value.pending || [])
 
   /** 粗略 ETA:优先用后端值,否则按「剩余条数 × 实测均值(默认 3s)」 */
   const etaSeconds = computed<number | null>(() => {
@@ -203,6 +214,7 @@ export const useJobsStore = defineStore('jobs', () => {
     doneFragments,
     runningProject,
     runningChapter,
+    pending,
     etaSeconds,
     etaLabel,
     connect,
